@@ -106,6 +106,122 @@ h1 {
     border-color: var(--primary-color);
 }
 
+.header-controls {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+/* Room Section */
+.room-section {
+    background: var(--card-bg);
+    border-radius: var(--radius-lg);
+    padding: 32px;
+    margin-bottom: 24px;
+    box-shadow: var(--shadow-lg);
+    text-align: center;
+}
+
+.room-description {
+    color: var(--text-secondary);
+    margin-bottom: 24px;
+}
+
+.room-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+    max-width: 400px;
+    margin: 0 auto;
+}
+
+.room-input-group {
+    display: flex;
+    gap: 12px;
+    width: 100%;
+}
+
+.room-input-group input {
+    flex: 1;
+    padding: 12px 16px;
+    border: 2px solid var(--border-color);
+    border-radius: var(--radius);
+    font-size: 1rem;
+    text-transform: uppercase;
+    text-align: center;
+    letter-spacing: 2px;
+    font-weight: 600;
+}
+
+.room-input-group input:focus {
+    outline: none;
+    border-color: var(--primary-color);
+}
+
+.room-divider {
+    position: relative;
+    width: 100%;
+    text-align: center;
+    margin: 8px 0;
+}
+
+.room-divider::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: var(--border-color);
+}
+
+.room-divider span {
+    position: relative;
+    padding: 0 16px;
+    background: var(--card-bg);
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+}
+
+.room-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(76, 175, 80, 0.1);
+    border: 1px solid var(--primary-color);
+    border-radius: var(--radius);
+}
+
+.room-label {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+}
+
+.room-code {
+    font-weight: 700;
+    font-size: 1.125rem;
+    letter-spacing: 1px;
+    color: var(--primary-color);
+}
+
+.icon-btn {
+    padding: 4px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--primary-color);
+    transition: opacity 0.3s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.icon-btn:hover {
+    opacity: 0.7;
+}
+
 /* Devices Section */
 .devices-section {
     background: var(--card-bg);

@@ -16,6 +16,8 @@ const state = {
     ws: null,
     clientId: null,
     deviceName: 'Device',
+    roomCode: null,
+    inRoom: false,
     peers: new Map(),
     connections: new Map(),
     dataChannels: new Map(),
@@ -33,6 +35,13 @@ document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     setupDragAndDrop();
     loadDeviceName();
+    
+    // Check if room code in URL params (for sharing)
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomFromUrl = urlParams.get('room');
+    if (roomFromUrl) {
+        document.getElementById('roomInput').value = roomFromUrl;
+    }
 });
 
 // WebSocket connection
@@ -92,16 +101,30 @@ function handleWebSocketMessage(event) {
     switch (message.type) {
         case 'init':
             state.clientId = message.clientId;
-            message.peers.forEach(peer => {
-                state.peers.set(peer.id, peer);
-            });
-            updateDevicesList();
+            if (message.needsRoom) {
+                // Show room selection UI
+                showRoomSection();
+            } else if (message.peers) {
+                // Legacy mode (local network only)
+                message.peers.forEach(peer => {
+                    state.peers.set(peer.id, peer);
+                });
+                updateDevicesList();
+            }
+            break;
+            
+        case 'room-created':
+            handleRoomCreated(message);
+            break;
+            
+        case 'room-joined':
+            handleRoomJoined(message);
             break;
             
         case 'peer-joined':
             state.peers.set(message.peer.id, message.peer);
             updateDevicesList();
-            showToast(`${message.peer.name} joined`, 'info');
+            showToast(`${message.peer.name} joined the room`, 'info');
             break;
             
         case 'peer-left':
@@ -130,7 +153,10 @@ function handleWebSocketMessage(event) {
         case 'error':
             console.error('Server error:', message.message);
             showToast(message.message, 'error');
-            if (message.code === 'SERVER_TRANSFER_BLOCKED' || message.code === 'EXCESSIVE_DATA_TRANSFER') {
+            
+            if (message.code === 'ROOM_NOT_FOUND') {
+                showRoomSection();
+            } else if (message.code === 'SERVER_TRANSFER_BLOCKED' || message.code === 'EXCESSIVE_DATA_TRANSFER') {
                 // Server detected file transfer attempt
                 state.ws.close();
             }
@@ -144,6 +170,67 @@ function handleWebSocketMessage(event) {
             // Keep-alive response
             break;
     }
+}
+
+// Handle room created
+function handleRoomCreated(message) {
+    state.roomCode = message.roomCode;
+    state.inRoom = true;
+    
+    hideRoomSection();
+    showRoomInfo(message.roomCode);
+    updateDevicesList();
+    
+    // Update URL with room code for easy sharing
+    const url = new URL(window.location);
+    url.searchParams.set('room', message.roomCode);
+    window.history.pushState({}, '', url);
+    
+    showToast(`Room created: ${message.roomCode}`, 'success');
+}
+
+// Handle room joined
+function handleRoomJoined(message) {
+    state.roomCode = message.roomCode;
+    state.inRoom = true;
+    
+    // Add existing peers in room
+    message.peers.forEach(peer => {
+        state.peers.set(peer.id, peer);
+    });
+    
+    hideRoomSection();
+    showRoomInfo(message.roomCode);
+    updateDevicesList();
+    
+    // Update URL with room code
+    const url = new URL(window.location);
+    url.searchParams.set('room', message.roomCode);
+    window.history.pushState({}, '', url);
+    
+    showToast(`Joined room: ${message.roomCode}`, 'success');
+}
+
+// Show room section
+function showRoomSection() {
+    document.getElementById('roomSection').style.display = 'block';
+    document.getElementById('devicesList').parentElement.style.display = 'none';
+    document.getElementById('queueSection').style.display = 'none';
+}
+
+// Hide room section
+function hideRoomSection() {
+    document.getElementById('roomSection').style.display = 'none';
+    document.getElementById('devicesList').parentElement.style.display = 'block';
+}
+
+// Show room info in header
+function showRoomInfo(roomCode) {
+    const roomInfo = document.getElementById('roomInfo');
+    const roomCodeElement = document.getElementById('roomCode');
+    
+    roomCodeElement.textContent = roomCode;
+    roomInfo.style.display = 'flex';
 }
 
 // WebRTC connection management
@@ -968,6 +1055,61 @@ function setupDragAndDrop() {
 
 // Event listeners
 function setupEventListeners() {
+    // Room management
+    const createRoomBtn = document.getElementById('createRoomBtn');
+    const joinRoomBtn = document.getElementById('joinRoomBtn');
+    const roomInput = document.getElementById('roomInput');
+    const copyRoomBtn = document.getElementById('copyRoomBtn');
+    
+    createRoomBtn.addEventListener('click', () => {
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+            state.ws.send(JSON.stringify({ type: 'create-room' }));
+        }
+    });
+    
+    joinRoomBtn.addEventListener('click', () => {
+        const roomCode = roomInput.value.trim().toUpperCase();
+        if (roomCode && roomCode.length === 6) {
+            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                state.ws.send(JSON.stringify({
+                    type: 'join-room',
+                    roomCode: roomCode
+                }));
+            }
+        } else {
+            showToast('Please enter a valid 6-character room code', 'warning');
+        }
+    });
+    
+    roomInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            joinRoomBtn.click();
+        }
+    });
+    
+    roomInput.addEventListener('input', (e) => {
+        e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    });
+    
+    copyRoomBtn.addEventListener('click', () => {
+        const roomCode = document.getElementById('roomCode').textContent;
+        
+        // Create shareable link
+        const url = new URL(window.location);
+        url.searchParams.set('room', roomCode);
+        const shareableLink = url.toString();
+        
+        // Copy to clipboard
+        navigator.clipboard.writeText(shareableLink).then(() => {
+            showToast('Room link copied to clipboard!', 'success');
+        }).catch(() => {
+            // Fallback to just room code
+            navigator.clipboard.writeText(roomCode).then(() => {
+                showToast('Room code copied!', 'success');
+            });
+        });
+    });
+    
     // Device name edit
     const deviceNameBtn = document.getElementById('deviceNameBtn');
     const nameModal = document.getElementById('nameModal');
