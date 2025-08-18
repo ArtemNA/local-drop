@@ -18,11 +18,6 @@ app.use(express.static('public'));
 app.use(express.json());
 app.use(cors());
 
-app.get('/live', (req, res) => {
-  const text = new Date().toISOString();
-  res.json({ text });
-});
-
 // Store rooms and clients
 const rooms = new Map(); // roomCode -> Set of clientIds
 const clients = new Map(); // clientId -> clientInfo
