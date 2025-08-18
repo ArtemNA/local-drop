@@ -1,10 +1,12 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const os = require('os');
 const crypto = require('crypto');
+const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
@@ -12,6 +14,14 @@ const wss = new WebSocketServer({ server });
 
 // Serve static files
 app.use(express.static('public'));
+
+app.use(express.json());
+app.use(cors());
+
+app.get('/live', (req, res) => {
+  const text = new Date().toISOString();
+  res.json({ text });
+});
 
 // Store rooms and clients
 const rooms = new Map(); // roomCode -> Set of clientIds
@@ -490,6 +500,19 @@ app.get('/api/info', (req, res) => {
     isPublicDeployment: process.env.PUBLIC_DEPLOY === 'true'
   });
 });
+
+function keepAlive() {
+  https.get('https://sync-video-server.onrender.com/live', (res) => {
+    //console.log(res)
+    res.on('data', () => {});
+    res.on('end', () => {});
+  }).on('error', (err) => {
+    console.log('Error: ', err.message);
+  });
+}
+
+// Run the keep-alive function every 14 minutes
+setInterval(keepAlive, 4 * 60 * 1000);
 
 // Start server
 const PORT = process.env.PORT || 3000;
