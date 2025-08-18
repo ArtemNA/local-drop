@@ -463,6 +463,15 @@ function leaveRoom(clientId, roomCode) {
   }
 }
 
+// Broadcast message to all clients except sender (for local mode)
+function broadcast(senderId, message) {
+  clients.forEach((client, id) => {
+    if (id !== senderId && client.ws.readyState === 1) {
+      client.ws.send(JSON.stringify(message));
+    }
+  });
+}
+
 // Broadcast message to all clients in room except sender
 function broadcastToRoom(roomCode, senderId, message) {
   const roomClients = getClientsInRoom(roomCode);
