@@ -155,22 +155,23 @@ wss.on('connection', (ws, req) => {
     });
   } else if (urlRoomCode) {
     // PUBLIC MODE - Join specific room from URL
-    console.log(`[Room] Client attempting to join room ${urlRoomCode} from URL`);
+    const normalizedRoomCode = urlRoomCode.toUpperCase();
+    console.log(`[Room] Client attempting to join room ${normalizedRoomCode} from URL`);
     
     // Try to join the room from URL
-    if (urlRoomCode.length === 6) {
+    if (normalizedRoomCode.length === 6) {
       // Create room if it doesn't exist
-      if (!rooms.has(urlRoomCode)) {
-        rooms.set(urlRoomCode, new Set());
-        console.log(`[Room] Created room ${urlRoomCode} from URL`);
+      if (!rooms.has(normalizedRoomCode)) {
+        rooms.set(normalizedRoomCode, new Set());
+        console.log(`[Room] Created room ${normalizedRoomCode} from URL`);
       }
       
       // Join the room
-      rooms.get(urlRoomCode).add(clientId);
-      clientInfo.roomCode = urlRoomCode;
+      rooms.get(normalizedRoomCode).add(clientId);
+      clientInfo.roomCode = normalizedRoomCode;
       
       // Get other peers in room
-      const peersInRoom = getClientsInRoom(urlRoomCode)
+      const peersInRoom = getClientsInRoom(normalizedRoomCode)
         .filter(client => client.id !== clientId)
         .map(client => ({
           id: client.id,
@@ -180,12 +181,12 @@ wss.on('connection', (ws, req) => {
       // Send room joined message
       ws.send(JSON.stringify({
         type: 'room-joined',
-        roomCode: urlRoomCode,
+        roomCode: normalizedRoomCode,
         peers: peersInRoom
       }));
       
       // Notify other room members
-      broadcastToRoom(urlRoomCode, clientId, {
+      broadcastToRoom(normalizedRoomCode, clientId, {
         type: 'peer-joined',
         peer: {
           id: clientId,
@@ -314,7 +315,9 @@ wss.on('connection', (ws, req) => {
           
         case 'join-room':
           if (PUBLIC_DEPLOY) {
-            handleJoinRoom(clientInfo, message.roomCode);
+            // Normalize room code to uppercase
+            const normalizedCode = message.roomCode.toUpperCase();
+            handleJoinRoom(clientInfo, normalizedCode);
           }
           break;
           
@@ -437,11 +440,14 @@ function handleCreateRoom(clientInfo) {
 
 // Handle joining room
 function handleJoinRoom(clientInfo, roomCode) {
+  // Normalize room code
+  const normalizedCode = roomCode.toUpperCase();
+  
   // Check if room exists
-  if (!rooms.has(roomCode)) {
+  if (!rooms.has(normalizedCode)) {
     // Create the room if it doesn't exist
-    rooms.set(roomCode, new Set());
-    console.log(`[Room] Created room ${roomCode} for joining`);
+    rooms.set(normalizedCode, new Set());
+    console.log(`[Room] Created room ${normalizedCode} for joining`);
   }
   
   // Leave current room if in one
@@ -450,13 +456,13 @@ function handleJoinRoom(clientInfo, roomCode) {
   }
   
   // Join new room
-  rooms.get(roomCode).add(clientInfo.id);
-  clientInfo.roomCode = roomCode;
+  rooms.get(normalizedCode).add(clientInfo.id);
+  clientInfo.roomCode = normalizedCode;
   
-  console.log(`[Room] Client ${clientInfo.id} joined room ${roomCode}`);
+  console.log(`[Room] Client ${clientInfo.id} joined room ${normalizedCode}`);
   
   // Get other peers in room
-  const peersInRoom = getClientsInRoom(roomCode)
+  const peersInRoom = getClientsInRoom(normalizedCode)
     .filter(client => client.id !== clientInfo.id)
     .map(client => ({
       id: client.id,
@@ -466,12 +472,12 @@ function handleJoinRoom(clientInfo, roomCode) {
   // Send room info to joining client
   clientInfo.ws.send(JSON.stringify({
     type: 'room-joined',
-    roomCode: roomCode,
+    roomCode: normalizedCode,
     peers: peersInRoom
   }));
   
   // Notify other room members
-  broadcastToRoom(roomCode, clientInfo.id, {
+  broadcastToRoom(normalizedCode, clientInfo.id, {
     type: 'peer-joined',
     peer: {
       id: clientInfo.id,
