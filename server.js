@@ -501,8 +501,13 @@ app.get('/api/info', (req, res) => {
   });
 });
 
+app.get('/live', (req, res) => {
+  const text = new Date().toISOString();
+  res.json({ text });
+});
+
 function keepAlive() {
-  https.get('https://sync-video-server.onrender.com/live', (res) => {
+  https.get('https://local-drop.onrender.com/live', (res) => {
     //console.log(res)
     res.on('data', () => {});
     res.on('end', () => {});
