@@ -96,7 +96,14 @@ const clientMessageStats = new Map();
 
 wss.on('connection', (ws, req) => {
   const clientId = uuidv4();
-  const clientIp = req.socket.remoteAddress;
+  
+  // Get real client IP (considering proxies)
+  let clientIp = req.socket.remoteAddress;
+  const forwardedFor = req.headers['x-forwarded-for'];
+  if (forwardedFor) {
+    clientIp = forwardedFor.split(',')[0].trim();
+  }
+  clientIp = clientIp.replace(/^::ffff:/, ''); // Clean IPv6 prefix
   
   // Initialize client info (without room initially)
   const clientInfo = {
@@ -119,66 +126,17 @@ wss.on('connection', (ws, req) => {
   
   console.log(`[Connect] Client ${clientId} connected from ${clientIp}`);
   
-  // Auto-join room based on IP if AUTO_ROOM mode is enabled
-  if (AUTO_ROOM_MODE && PUBLIC_DEPLOY) {
-    // Get or create room for this IP
-    let roomCode = ipRooms.get(clientIp);
-    
-    if (!roomCode) {
-      // Generate room code from IP
-      roomCode = generateRoomFromIP(clientIp);
-      ipRooms.set(clientIp, roomCode);
-      
-      // Create room if it doesn't exist
-      if (!rooms.has(roomCode)) {
-        rooms.set(roomCode, new Set());
-        console.log(`[Auto-Room] Created room ${roomCode} for IP ${clientIp}`);
-      }
-    }
-    
-    // Join the room automatically
-    rooms.get(roomCode).add(clientId);
-    clientInfo.roomCode = roomCode;
-    
-    console.log(`[Auto-Room] Client ${clientId} auto-joined room ${roomCode}`);
-    
-    // Get other peers in room
-    const peersInRoom = getClientsInRoom(roomCode)
-      .filter(client => client.id !== clientId)
-      .map(client => ({
-        id: client.id,
-        name: client.name
-      }));
-    
-    // Send init with room info and peers
+  // Check if URL has room parameter
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const urlRoomCode = url.searchParams.get('room');
+  
+  // Handle different modes
+  if (!PUBLIC_DEPLOY) {
+    // LOCAL MODE - no rooms, all devices see each other
     ws.send(JSON.stringify({
       type: 'init',
       clientId: clientId,
-      autoRoom: true,
-      roomCode: roomCode,
-      peers: peersInRoom
-    }));
-    
-    // Notify other room members
-    broadcastToRoom(roomCode, clientId, {
-      type: 'peer-joined',
-      peer: {
-        id: clientId,
-        name: clientInfo.name
-      }
-    });
-  } else if (PUBLIC_DEPLOY) {
-    // Manual room mode (default for public deploy)
-    ws.send(JSON.stringify({
-      type: 'init',
-      clientId: clientId,
-      needsRoom: true
-    }));
-  } else {
-    // Local network mode (no rooms)
-    ws.send(JSON.stringify({
-      type: 'init',
-      clientId: clientId,
+      localMode: true,
       peers: Array.from(clients.entries())
         .filter(([id]) => id !== clientId)
         .map(([id, info]) => ({
@@ -187,7 +145,7 @@ wss.on('connection', (ws, req) => {
         }))
     }));
     
-    // Notify other clients about new peer (local mode)
+    // Notify other clients about new peer
     broadcast(clientId, {
       type: 'peer-joined',
       peer: {
@@ -195,6 +153,73 @@ wss.on('connection', (ws, req) => {
         name: clientInfo.name
       }
     });
+  } else if (urlRoomCode) {
+    // PUBLIC MODE - Join specific room from URL
+    console.log(`[Room] Client attempting to join room ${urlRoomCode} from URL`);
+    
+    // Try to join the room from URL
+    if (urlRoomCode.length === 6) {
+      // Create room if it doesn't exist
+      if (!rooms.has(urlRoomCode)) {
+        rooms.set(urlRoomCode, new Set());
+        console.log(`[Room] Created room ${urlRoomCode} from URL`);
+      }
+      
+      // Join the room
+      rooms.get(urlRoomCode).add(clientId);
+      clientInfo.roomCode = urlRoomCode;
+      
+      // Get other peers in room
+      const peersInRoom = getClientsInRoom(urlRoomCode)
+        .filter(client => client.id !== clientId)
+        .map(client => ({
+          id: client.id,
+          name: client.name
+        }));
+      
+      // Send room joined message
+      ws.send(JSON.stringify({
+        type: 'room-joined',
+        roomCode: urlRoomCode,
+        peers: peersInRoom
+      }));
+      
+      // Notify other room members
+      broadcastToRoom(urlRoomCode, clientId, {
+        type: 'peer-joined',
+        peer: {
+          id: clientId,
+          name: clientInfo.name
+        }
+      });
+    } else {
+      // Invalid room code, show room selection
+      ws.send(JSON.stringify({
+        type: 'init',
+        clientId: clientId,
+        needsRoom: true
+      }));
+    }
+  } else if (AUTO_ROOM_MODE) {
+    // AUTO ROOM MODE - Only use for local network detection, not for public
+    // This is problematic for public deployment as everyone gets same server IP
+    // So we'll disable auto-room for public deployment and show warning
+    console.log('[Warning] AUTO_ROOM mode is not recommended for public deployment');
+    
+    // Show room selection instead
+    ws.send(JSON.stringify({
+      type: 'init', 
+      clientId: clientId,
+      needsRoom: true,
+      message: 'Please create or join a room'
+    }));
+  } else {
+    // PUBLIC MODE - Manual room selection
+    ws.send(JSON.stringify({
+      type: 'init',
+      clientId: clientId,
+      needsRoom: true
+    }));
   }
   
   ws.on('message', (data) => {
@@ -282,13 +307,13 @@ wss.on('connection', (ws, req) => {
       
       switch (message.type) {
         case 'create-room':
-          if (!AUTO_ROOM_MODE && PUBLIC_DEPLOY) {
+          if (PUBLIC_DEPLOY) {
             handleCreateRoom(clientInfo);
           }
           break;
           
         case 'join-room':
-          if (!AUTO_ROOM_MODE && PUBLIC_DEPLOY) {
+          if (PUBLIC_DEPLOY) {
             handleJoinRoom(clientInfo, message.roomCode);
           }
           break;
@@ -385,6 +410,11 @@ wss.on('connection', (ws, req) => {
 
 // Handle room creation
 function handleCreateRoom(clientInfo) {
+  // Leave current room if in one
+  if (clientInfo.roomCode) {
+    leaveRoom(clientInfo.id, clientInfo.roomCode);
+  }
+  
   // Generate unique room code
   let roomCode;
   do {
@@ -409,12 +439,9 @@ function handleCreateRoom(clientInfo) {
 function handleJoinRoom(clientInfo, roomCode) {
   // Check if room exists
   if (!rooms.has(roomCode)) {
-    clientInfo.ws.send(JSON.stringify({
-      type: 'error',
-      message: 'Room not found',
-      code: 'ROOM_NOT_FOUND'
-    }));
-    return;
+    // Create the room if it doesn't exist
+    rooms.set(roomCode, new Set());
+    console.log(`[Room] Created room ${roomCode} for joining`);
   }
   
   // Leave current room if in one

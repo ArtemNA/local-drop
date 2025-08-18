@@ -37,19 +37,21 @@ document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     setupDragAndDrop();
     loadDeviceName();
-    
-    // Check if room code in URL params (for sharing)
-    const urlParams = new URLSearchParams(window.location.search);
-    const roomFromUrl = urlParams.get('room');
-    if (roomFromUrl) {
-        document.getElementById('roomInput').value = roomFromUrl;
-    }
 });
 
 // WebSocket connection
 function initializeWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`;
+    
+    // Check if room code in URL params
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomFromUrl = urlParams.get('room');
+    
+    // Include room in WebSocket URL if present
+    let wsUrl = `${protocol}//${window.location.host}`;
+    if (roomFromUrl) {
+        wsUrl += `?room=${roomFromUrl}`;
+    }
     
     state.ws = new WebSocket(wsUrl);
     
@@ -104,29 +106,31 @@ function handleWebSocketMessage(event) {
         case 'init':
             state.clientId = message.clientId;
             
-            if (message.autoRoom) {
-                // Auto-room mode - already joined a room
-                state.roomCode = message.roomCode;
-                state.inRoom = true;
-                
-                // Add existing peers
+            if (message.localMode) {
+                // Local mode - no rooms needed
+                state.inRoom = false;
                 message.peers.forEach(peer => {
                     state.peers.set(peer.id, peer);
                 });
                 
-                // Show room info
-                showRoomInfo(message.roomCode);
-                showAutoRoomNotice(message.roomCode);
+                // Hide room section, show devices
+                document.getElementById('roomSection').style.display = 'none';
+                document.getElementById('devicesList').parentElement.style.display = 'block';
                 updateDevicesList();
             } else if (message.needsRoom) {
-                // Manual room mode - show room selection UI
+                // Need to select/create room
                 showRoomSection();
-            } else if (message.peers) {
-                // Legacy/local mode - no rooms
-                message.peers.forEach(peer => {
-                    state.peers.set(peer.id, peer);
-                });
-                updateDevicesList();
+                
+                // Pre-fill room input if in URL
+                const urlParams = new URLSearchParams(window.location.search);
+                const roomFromUrl = urlParams.get('room');
+                if (roomFromUrl) {
+                    document.getElementById('roomInput').value = roomFromUrl;
+                    // Auto-click join if room code is pre-filled
+                    setTimeout(() => {
+                        document.getElementById('joinRoomBtn').click();
+                    }, 500);
+                }
             }
             break;
             
@@ -141,7 +145,7 @@ function handleWebSocketMessage(event) {
         case 'peer-joined':
             state.peers.set(message.peer.id, message.peer);
             updateDevicesList();
-            showToast(`${message.peer.name} joined the room`, 'info');
+            showToast(`${message.peer.name} joined`, 'info');
             break;
             
         case 'peer-left':
@@ -248,16 +252,6 @@ function showRoomInfo(roomCode) {
     
     roomCodeElement.textContent = roomCode;
     roomInfo.style.display = 'flex';
-}
-
-// Show auto-room notice
-function showAutoRoomNotice(roomCode) {
-    showToast(`Auto-joined room ${roomCode} based on your network`, 'info');
-    
-    // Update URL with room code for sharing
-    const url = new URL(window.location);
-    url.searchParams.set('room', roomCode);
-    window.history.pushState({}, '', url);
 }
 
 // WebRTC connection management

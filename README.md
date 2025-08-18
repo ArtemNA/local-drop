@@ -48,22 +48,23 @@ npm start
 - No room codes needed
 - Perfect for home/office use
 
-#### Mode 2: Public with Manual Rooms
+#### Mode 2: Public with Manual Rooms (Recommended for cloud)
 ```bash
 PUBLIC_DEPLOY=true npm start
 ```
 - Users create/join rooms manually
+- Share room links: `https://your-app.com?room=ABC123`
 - Complete control over who connects
 - Best for public deployment
 
-#### Mode 3: Public with Auto Rooms (Network-based)
+#### Mode 3: Auto Rooms (⚠️ NOT for public cloud)
 ```bash
-PUBLIC_DEPLOY=true AUTO_ROOM=true npm start
+# Only for private servers with local network detection
+AUTO_ROOM=true npm start
 ```
-- Devices from same network auto-join same room
-- Room codes generated from IP addresses
-- Seamless experience for users from same location
-- Note: This groups by external IP, so all users behind same NAT/router join same room
+- ⚠️ **WARNING**: Don't use with PUBLIC_DEPLOY on cloud platforms
+- On cloud, all users share same server IP and end up in same room
+- Only useful for private servers that can detect local network segments
 
 ### Deployment Options
 
