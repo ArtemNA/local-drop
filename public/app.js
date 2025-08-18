@@ -4,8 +4,8 @@ const CONFIG = {
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' }
     ],
-    chunkSize: 64 * 1024, // 64KB chunks for better performance
-    bufferThreshold: 8 * 1024 * 1024, // 8MB buffer threshold (lowered for stability)
+    chunkSize: 256 * 1024, // 64KB chunks for better performance
+    bufferThreshold: 64 * 1024 * 1024, // 8MB buffer threshold (lowered for stability)
     bufferCheckInterval: 25, // Check buffer every 25ms
     reconnectDelay: 3000,
     reconnectMaxAttempts: 5,
