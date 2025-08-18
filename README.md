@@ -192,6 +192,27 @@ const CONFIG = {
 
 ## 🐛 Troubleshooting
 
+### Large Files (20MB+)
+
+The latest version includes optimizations for large file transfers:
+- **Flow control** prevents buffer overflow
+- **Binary transfer** for better performance  
+- **Automatic speed adjustment** based on network conditions
+
+If you experience issues, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for detailed solutions.
+
+### Quick Fixes
+
+**Slow transfer?**
+- Use wired connection instead of Wi-Fi
+- Close other bandwidth-heavy applications
+- Try Chrome/Edge for best performance
+
+**Connection failed?**
+- Check firewall settings
+- Disable VPN temporarily
+- Ensure both devices are in the same room (for public deployment)
+
 ### Room Issues
 
 **Can't join room:**
