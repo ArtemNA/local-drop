@@ -970,6 +970,7 @@ function openFilePicker(peerId) {
 
 // Handle file selection
 function handleFileSelection(files, peerId) {
+    console.log(files)
     if (files.length === 0) return;
     
     const peer = state.peers.get(peerId);
@@ -1010,9 +1011,8 @@ function handleFileSelection(files, peerId) {
         
         previewArea.appendChild(preview);
     });
-    
     // Store files for sending
-    state.pendingFiles.set(peerId, files);
+    state.pendingFiles.set(peerId, Array.from(files));
     
     // Show send button
     sendFilesBtn.style.display = 'inline-block';
@@ -1290,7 +1290,11 @@ function setupDragAndDrop() {
     sendFilesBtn.addEventListener('click', async () => {
         const peerId = state.selectedPeer;
         const files = state.pendingFiles.get(peerId);
-        
+
+        console.log(peerId)
+        console.log(files)
+        console.log(state.pendingFiles)
+
         if (files && files.length > 0 && peerId) {
             await sendFiles(peerId, files);
             hideDropZone();
@@ -1308,7 +1312,7 @@ function setupDragAndDrop() {
         draggedFiles = [];
         targetPeerId = null;
         state.selectedPeer = null;
-        state.pendingFiles.clear();
+        // state.pendingFiles.clear();
     }
 }
 
