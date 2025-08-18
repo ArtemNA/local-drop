@@ -92,6 +92,12 @@ const clientMessageStats = new Map();
 wss.on('connection', (ws, req) => {
   const clientId = uuidv4();
   
+  // Parse URL parameters
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const urlRoomCode = url.searchParams.get('room');
+  const clientLocalIP = url.searchParams.get('localIP');
+  const deviceName = url.searchParams.get('deviceName');
+  
   // Get real client IP (considering proxies)
   let clientIp = req.socket.remoteAddress;
   const forwardedFor = req.headers['x-forwarded-for'];
@@ -100,12 +106,13 @@ wss.on('connection', (ws, req) => {
   }
   clientIp = clientIp.replace(/^::ffff:/, ''); // Clean IPv6 prefix
   
-  // Initialize client info (without room initially)
+  // Initialize client info
   const clientInfo = {
     id: clientId,
     ws: ws,
-    name: `Device-${clientId.slice(0, 6)}`,
+    name: deviceName ? decodeURIComponent(deviceName) : `Device-${clientId.slice(0, 6)}`,
     ip: clientIp,
+    localIP: clientLocalIP, // Store client's local IP for auto-room
     roomCode: null,
     bytesReceived: 0,
     messageCount: 0,
@@ -119,11 +126,7 @@ wss.on('connection', (ws, req) => {
     suspiciousActivity: false
   });
   
-  console.log(`[Connect] Client ${clientId} connected from ${clientIp}`);
-  
-  // Check if URL has room parameter
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const urlRoomCode = url.searchParams.get('room');
+  console.log(`[Connect] Client ${clientId} connected from ${clientIp} (local: ${clientLocalIP})`);
   
   // Handle different modes
   if (!PUBLIC_DEPLOY) {
@@ -131,6 +134,7 @@ wss.on('connection', (ws, req) => {
     ws.send(JSON.stringify({
       type: 'init',
       clientId: clientId,
+      deviceName: clientInfo.name,
       localMode: true,
       peers: Array.from(clients.entries())
         .filter(([id]) => id !== clientId)
@@ -177,6 +181,7 @@ wss.on('connection', (ws, req) => {
       ws.send(JSON.stringify({
         type: 'room-joined',
         roomCode: normalizedRoomCode,
+        deviceName: clientInfo.name,
         peers: peersInRoom
       }));
       
@@ -193,27 +198,60 @@ wss.on('connection', (ws, req) => {
       ws.send(JSON.stringify({
         type: 'init',
         clientId: clientId,
+        deviceName: clientInfo.name,
         needsRoom: true
       }));
     }
-  } else if (AUTO_ROOM_MODE) {
-    // AUTO ROOM MODE - Only use for local network detection, not for public
-    // This is problematic for public deployment as everyone gets same server IP
-    // So we'll disable auto-room for public deployment and show warning
-    console.log('[Warning] AUTO_ROOM mode is not recommended for public deployment');
+  } else if (AUTO_ROOM_MODE && clientLocalIP) {
+    // AUTO ROOM MODE - Use client's local IP to group devices
+    console.log(`[Auto-Room] Processing client with local IP: ${clientLocalIP}`);
     
-    // Show room selection instead
+    // Generate room code from local IP
+    const roomCode = generateRoomFromIP(clientLocalIP);
+    
+    // Create room if it doesn't exist
+    if (!rooms.has(roomCode)) {
+      rooms.set(roomCode, new Set());
+      console.log(`[Auto-Room] Created room ${roomCode} for local IP ${clientLocalIP}`);
+    }
+    
+    // Join the room
+    rooms.get(roomCode).add(clientId);
+    clientInfo.roomCode = roomCode;
+    
+    // Get other peers in room
+    const peersInRoom = getClientsInRoom(roomCode)
+      .filter(client => client.id !== clientId)
+      .map(client => ({
+        id: client.id,
+        name: client.name
+      }));
+    
+    console.log(`[Auto-Room] Client ${clientId} auto-joined room ${roomCode}`);
+    
+    // Send init with room info and peers
     ws.send(JSON.stringify({
-      type: 'init', 
-      clientId: clientId,
-      needsRoom: true,
-      message: 'Please create or join a room'
+      type: 'room-joined',
+      roomCode: roomCode,
+      deviceName: clientInfo.name,
+      autoRoom: true,
+      peers: peersInRoom
     }));
+    
+    // Notify other room members
+    broadcastToRoom(roomCode, clientId, {
+      type: 'peer-joined',
+      peer: {
+        id: clientId,
+        name: clientInfo.name
+      }
+    });
   } else {
     // PUBLIC MODE - Manual room selection
     ws.send(JSON.stringify({
       type: 'init',
       clientId: clientId,
+      deviceName: clientInfo.name,
       needsRoom: true
     }));
   }
@@ -525,27 +563,10 @@ app.get('/api/info', (req, res) => {
   res.json({
     totalClients: clients.size,
     totalRooms: rooms.size,
-    isPublicDeployment: process.env.PUBLIC_DEPLOY === 'true'
+    isPublicDeployment: PUBLIC_DEPLOY,
+    autoRoomEnabled: AUTO_ROOM_MODE
   });
 });
-
-app.get('/live', (req, res) => {
-  const text = new Date().toISOString();
-  res.json({ text });
-});
-
-function keepAlive() {
-  https.get('https://local-drop.onrender.com/live', (res) => {
-    //console.log(res)
-    res.on('data', () => {});
-    res.on('end', () => {});
-  }).on('error', (err) => {
-    console.log('Error: ', err.message);
-  });
-}
-
-// Run the keep-alive function every 14 minutes
-setInterval(keepAlive, 4 * 60 * 1000);
 
 // Start server
 const PORT = process.env.PORT || 3000;
@@ -562,8 +583,8 @@ server.listen(PORT, '0.0.0.0', () => {
   if (PUBLIC_DEPLOY) {
     if (AUTO_ROOM_MODE) {
       console.log('🌍 Running in PUBLIC mode with AUTO-ROOM');
-      console.log('🔐 Users from same network auto-join same room');
-      console.log('📝 Room codes are generated from IP addresses');
+      console.log('🔐 Devices from same local network auto-join same room');
+      console.log('📝 Room codes are generated from client local IP');
     } else {
       console.log('🌍 Running in PUBLIC mode with MANUAL ROOMS');
       console.log('📝 Users must create/join rooms to connect');

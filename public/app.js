@@ -28,15 +28,59 @@ const state = {
     pendingFiles: new Map(),
     selectedPeer: null,
     reconnectAttempts: 0,
-    isReconnecting: false
+    isReconnecting: false,
+    localIP: null
 };
 
+// Get local IP address using WebRTC
+async function getLocalIP() {
+    return new Promise((resolve) => {
+        const pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+        
+        pc.createDataChannel('');
+        pc.createOffer().then(offer => pc.setLocalDescription(offer));
+        
+        pc.onicecandidate = (event) => {
+            if (!event || !event.candidate || !event.candidate.candidate) {
+                pc.close();
+                resolve(null);
+                return;
+            }
+            
+            const candidate = event.candidate.candidate;
+            const ipRegex = /([0-9]{1,3}\.){3}[0-9]{1,3}/;
+            const match = candidate.match(ipRegex);
+            
+            if (match) {
+                const ip = match[0];
+                // Filter out common non-routable IPs
+                if (!ip.startsWith('0.') && !ip.startsWith('127.')) {
+                    pc.close();
+                    resolve(ip);
+                }
+            }
+        };
+        
+        // Timeout after 2 seconds
+        setTimeout(() => {
+            pc.close();
+            resolve(null);
+        }, 2000);
+    });
+}
+
 // Initialize application
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    // Try to detect local IP for auto-room feature
+    state.localIP = await getLocalIP();
+    console.log('Detected local IP:', state.localIP);
+    
+    loadDeviceName();
     initializeWebSocket();
     setupEventListeners();
     setupDragAndDrop();
-    loadDeviceName();
 });
 
 // WebSocket connection
@@ -47,10 +91,26 @@ function initializeWebSocket() {
     const urlParams = new URLSearchParams(window.location.search);
     const roomFromUrl = urlParams.get('room');
     
-    // Include room in WebSocket URL if present
+    // Build WebSocket URL with parameters
     let wsUrl = `${protocol}//${window.location.host}`;
+    const params = new URLSearchParams();
+    
     if (roomFromUrl) {
-        wsUrl += `?room=${roomFromUrl}`;
+        params.append('room', roomFromUrl);
+    }
+    
+    // Include local IP if detected (for auto-room feature)
+    if (state.localIP) {
+        params.append('localIP', state.localIP);
+    }
+    
+    // Include saved device name
+    if (state.deviceName && state.deviceName !== 'Device') {
+        params.append('deviceName', encodeURIComponent(state.deviceName));
+    }
+    
+    if (params.toString()) {
+        wsUrl += '?' + params.toString();
     }
     
     state.ws = new WebSocket(wsUrl);
@@ -106,6 +166,12 @@ function handleWebSocketMessage(event) {
         case 'init':
             state.clientId = message.clientId;
             
+            // Update device name if server sends one
+            if (message.deviceName) {
+                state.deviceName = message.deviceName;
+                document.getElementById('deviceName').textContent = message.deviceName;
+            }
+            
             if (message.localMode) {
                 // Local mode - no rooms needed
                 state.inRoom = false;
@@ -139,7 +205,34 @@ function handleWebSocketMessage(event) {
             break;
             
         case 'room-joined':
-            handleRoomJoined(message);
+            // Update device name if server sends one
+            if (message.deviceName) {
+                state.deviceName = message.deviceName;
+                document.getElementById('deviceName').textContent = message.deviceName;
+            }
+            
+            state.roomCode = message.roomCode;
+            state.inRoom = true;
+            
+            // Add existing peers in room
+            message.peers.forEach(peer => {
+                state.peers.set(peer.id, peer);
+            });
+            
+            hideRoomSection();
+            showRoomInfo(message.roomCode);
+            updateDevicesList();
+            
+            // Update URL with room code
+            const url = new URL(window.location);
+            url.searchParams.set('room', message.roomCode);
+            window.history.pushState({}, '', url);
+            
+            if (message.autoRoom) {
+                showToast(`Auto-joined room ${message.roomCode} (same network)`, 'success');
+            } else {
+                showToast(`Joined room: ${message.roomCode}`, 'success');
+            }
             break;
             
         case 'peer-joined':
@@ -208,28 +301,6 @@ function handleRoomCreated(message) {
     window.history.pushState({}, '', url);
     
     showToast(`Room created: ${message.roomCode}`, 'success');
-}
-
-// Handle room joined
-function handleRoomJoined(message) {
-    state.roomCode = message.roomCode;
-    state.inRoom = true;
-    
-    // Add existing peers in room
-    message.peers.forEach(peer => {
-        state.peers.set(peer.id, peer);
-    });
-    
-    hideRoomSection();
-    showRoomInfo(message.roomCode);
-    updateDevicesList();
-    
-    // Update URL with room code
-    const url = new URL(window.location);
-    url.searchParams.set('room', message.roomCode);
-    window.history.pushState({}, '', url);
-    
-    showToast(`Joined room: ${message.roomCode}`, 'success');
 }
 
 // Show room section
@@ -1387,7 +1458,7 @@ function setupEventListeners() {
             document.getElementById('deviceName').textContent = newName;
             localStorage.setItem('deviceName', newName);
             
-            // Notify server
+            // Notify server about name change
             if (state.ws && state.ws.readyState === WebSocket.OPEN) {
                 state.ws.send(JSON.stringify({
                     type: 'set-name',
@@ -1436,6 +1507,7 @@ function loadDeviceName() {
         const defaultName = `Device-${Math.random().toString(36).substr(2, 6)}`;
         state.deviceName = defaultName;
         document.getElementById('deviceName').textContent = defaultName;
+        localStorage.setItem('deviceName', defaultName);
     }
 }
 
