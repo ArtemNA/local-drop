@@ -7,10 +7,15 @@ A completely local file transfer application that allows secure P2P file sharing
 - **🔒 Completely P2P**: Files are transferred directly between devices via WebRTC DataChannel, never through the server
 - **🛡️ Server Protection**: Built-in detection and blocking of file transfer attempts through the server
 - **📱 Cross-Platform**: Works on Mac, PC, Android, iOS - any device with a modern web browser
-- **🏠 Room System**: Create private rooms for secure file sharing (perfect for public deployment)
-- **🎯 Drag & Drop**: Simply drag files onto a device to send them
+- **🏠 Room System**: Three modes available:
+  - **Local Mode**: Auto-discovery on same network
+  - **Manual Rooms**: Create/join rooms with codes
+  - **Auto Rooms**: Automatic room assignment based on network
+- **📂 Multiple Ways to Send**:
+  - **Drag & Drop**: Drag files onto device cards
+  - **Click to Select**: Click connected device to open file picker (mobile-friendly!)
 - **🖼️ Image Preview**: Preview images before sending
-- **📊 Progress Tracking**: Real-time progress bars for all transfers
+- **📊 Progress Tracking**: Real-time progress bars with speed indicators
 - **🔄 Resume Support**: Automatically resume interrupted transfers
 - **📦 Queue System**: Send multiple files in a queue
 - **🔌 Auto-Reconnection**: Automatically reconnects if connection is lost
@@ -35,19 +40,30 @@ npm install
 
 ### Running the Server
 
-#### Local Mode (Same Network Only)
+#### Mode 1: Local Network Only (Default)
 ```bash
 npm start
 ```
+- All devices on same network see each other automatically
+- No room codes needed
+- Perfect for home/office use
 
-#### Public Mode (Deploy to Cloud)
+#### Mode 2: Public with Manual Rooms
 ```bash
-# Set environment variable for public mode
 PUBLIC_DEPLOY=true npm start
-
-# Or on Windows
-set PUBLIC_DEPLOY=true && npm start
 ```
+- Users create/join rooms manually
+- Complete control over who connects
+- Best for public deployment
+
+#### Mode 3: Public with Auto Rooms (Network-based)
+```bash
+PUBLIC_DEPLOY=true AUTO_ROOM=true npm start
+```
+- Devices from same network auto-join same room
+- Room codes generated from IP addresses
+- Seamless experience for users from same location
+- Note: This groups by external IP, so all users behind same NAT/router join same room
 
 ### Deployment Options
 
@@ -84,25 +100,40 @@ git push heroku public-deploy-rooms:main
 
 ## 📖 How to Use
 
-### Room-Based System (Public Deployment)
+### Sending Files
 
+**Method 1: Click to Select (Mobile-Friendly)**
+1. Connect to a device by clicking it
+2. Click the connected device again
+3. Choose files using the file picker
+4. Preview and send
+
+**Method 2: Drag & Drop (Desktop)**
+1. Connect to a device
+2. Drag files from your file explorer
+3. Drop them onto the connected device
+4. Preview and send
+
+### Room Systems
+
+#### Auto-Room Mode (Simplest)
+- Devices from same network automatically join same room
+- No setup required - just open the app
+- Perfect for offices, schools, or homes
+
+#### Manual Room Mode
 1. **Create a Room**:
    - Click "Create New Room"
-   - Share the room code or link with others
+   - Share the 6-character code or link
    
 2. **Join a Room**:
-   - Enter the 6-character room code
-   - Or use the shared link with `?room=XXXXXX` parameter
-   
-3. **Share Files**:
-   - Only devices in the same room can see each other
-   - Drag and drop files onto connected devices
+   - Enter the room code
+   - Or use the shared link
 
-### Local Network Mode
-
-1. Open the app URL on all devices in the same Wi-Fi network
-2. Devices automatically appear without room codes
-3. Click to connect and start sharing
+#### Local Network Mode
+- Open app on all devices in same Wi-Fi
+- Devices appear automatically
+- No room codes needed
 
 ## 🔐 Security & Privacy
 

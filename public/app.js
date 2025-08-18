@@ -103,11 +103,26 @@ function handleWebSocketMessage(event) {
     switch (message.type) {
         case 'init':
             state.clientId = message.clientId;
-            if (message.needsRoom) {
-                // Show room selection UI
+            
+            if (message.autoRoom) {
+                // Auto-room mode - already joined a room
+                state.roomCode = message.roomCode;
+                state.inRoom = true;
+                
+                // Add existing peers
+                message.peers.forEach(peer => {
+                    state.peers.set(peer.id, peer);
+                });
+                
+                // Show room info
+                showRoomInfo(message.roomCode);
+                showAutoRoomNotice(message.roomCode);
+                updateDevicesList();
+            } else if (message.needsRoom) {
+                // Manual room mode - show room selection UI
                 showRoomSection();
             } else if (message.peers) {
-                // Legacy mode (local network only)
+                // Legacy/local mode - no rooms
                 message.peers.forEach(peer => {
                     state.peers.set(peer.id, peer);
                 });
@@ -233,6 +248,16 @@ function showRoomInfo(roomCode) {
     
     roomCodeElement.textContent = roomCode;
     roomInfo.style.display = 'flex';
+}
+
+// Show auto-room notice
+function showAutoRoomNotice(roomCode) {
+    showToast(`Auto-joined room ${roomCode} based on your network`, 'info');
+    
+    // Update URL with room code for sharing
+    const url = new URL(window.location);
+    url.searchParams.set('room', roomCode);
+    window.history.pushState({}, '', url);
 }
 
 // WebRTC connection management
@@ -882,6 +907,7 @@ function updateDevicesList() {
                 </svg>
                 <p>No other devices found</p>
                 <small>Make sure devices are on the same network</small>
+                <small class="mobile-hint">On mobile? Ask others to share the room link</small>
             </div>
         `;
         return;
@@ -909,19 +935,87 @@ function updateDevicesList() {
                 </svg>
             </div>
             <div class="device-name">${peer.name}</div>
-            <div class="device-status">${isConnected ? 'Connected' : 'Click to connect'}</div>
+            <div class="device-status">${isConnected ? 'Click to send files' : 'Click to connect'}</div>
         `;
         
         deviceCard.addEventListener('click', () => {
             if (!isConnected) {
                 connectToPeer(peerId);
             } else {
-                showToast('Already connected', 'info');
+                // Show file selection dialog for connected device
+                openFilePicker(peerId);
             }
         });
         
         devicesList.appendChild(deviceCard);
     });
+}
+
+// Open file picker for sending files
+function openFilePicker(peerId) {
+    state.selectedPeer = peerId;
+    const peer = state.peers.get(peerId);
+    
+    // Show drop zone
+    const dropZone = document.getElementById('dropZone');
+    const dropTargetName = document.getElementById('dropTargetName');
+    dropTargetName.textContent = peer?.name || 'device';
+    
+    // Clear preview area
+    document.getElementById('previewArea').innerHTML = '';
+    document.getElementById('sendFilesBtn').style.display = 'none';
+    
+    dropZone.classList.remove('hidden');
+}
+
+// Handle file selection
+function handleFileSelection(files, peerId) {
+    if (files.length === 0) return;
+    
+    const peer = state.peers.get(peerId);
+    const previewArea = document.getElementById('previewArea');
+    const sendFilesBtn = document.getElementById('sendFilesBtn');
+    
+    // Clear previous previews
+    previewArea.innerHTML = '';
+    
+    // Create previews
+    Array.from(files).forEach(file => {
+        const preview = document.createElement('div');
+        preview.className = 'file-preview';
+        
+        if (file.type.startsWith('image/')) {
+            const img = document.createElement('img');
+            img.src = URL.createObjectURL(file);
+            preview.appendChild(img);
+        } else {
+            const icon = document.createElement('div');
+            icon.className = 'file-preview-icon';
+            icon.innerHTML = `
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+                    <polyline points="13 2 13 9 20 9"></polyline>
+                </svg>
+            `;
+            preview.appendChild(icon);
+        }
+        
+        const info = document.createElement('div');
+        info.className = 'file-info';
+        info.innerHTML = `
+            <div class="file-name">${file.name}</div>
+            <div class="file-size">${formatFileSize(file.size)}</div>
+        `;
+        preview.appendChild(info);
+        
+        previewArea.appendChild(preview);
+    });
+    
+    // Store files for sending
+    state.pendingFiles.set(peerId, files);
+    
+    // Show send button
+    sendFilesBtn.style.display = 'inline-block';
 }
 
 function updateConnectionStatus(connected) {
@@ -1073,15 +1167,32 @@ function showToast(message, type = 'info') {
     }, 3000);
 }
 
-// Drag and Drop
+// Drag and Drop + File Picker
 function setupDragAndDrop() {
     const dropZone = document.getElementById('dropZone');
     const previewArea = document.getElementById('previewArea');
     const sendFilesBtn = document.getElementById('sendFilesBtn');
+    const selectFilesBtn = document.getElementById('selectFilesBtn');
     const cancelDropBtn = document.getElementById('cancelDropBtn');
+    const fileInput = document.getElementById('fileInput');
     
     let draggedFiles = [];
     let targetPeerId = null;
+    
+    // File input change handler
+    fileInput.addEventListener('change', (e) => {
+        const files = e.target.files;
+        if (files.length > 0 && state.selectedPeer) {
+            handleFileSelection(files, state.selectedPeer);
+        }
+        // Reset input for next selection
+        fileInput.value = '';
+    });
+    
+    // Select files button
+    selectFilesBtn.addEventListener('click', () => {
+        fileInput.click();
+    });
     
     // Prevent default drag behaviors
     document.addEventListener('dragover', (e) => {
@@ -1096,8 +1207,14 @@ function setupDragAndDrop() {
     document.addEventListener('dragenter', (e) => {
         const deviceCard = e.target.closest('.device-card');
         if (deviceCard) {
-            document.body.classList.add('dragging');
-            deviceCard.classList.add('drag-over');
+            const peerId = deviceCard.dataset.peerId;
+            const isConnected = state.dataChannels.has(peerId) && 
+                              state.dataChannels.get(peerId).readyState === 'open';
+            
+            if (isConnected) {
+                document.body.classList.add('dragging');
+                deviceCard.classList.add('drag-over');
+            }
         }
     });
     
@@ -1120,23 +1237,62 @@ function setupDragAndDrop() {
         deviceCard.classList.remove('drag-over');
         
         const peerId = deviceCard.dataset.peerId;
+        const isConnected = state.dataChannels.has(peerId) && 
+                          state.dataChannels.get(peerId).readyState === 'open';
+        
+        if (!isConnected) {
+            showToast('Please connect to the device first', 'warning');
+            return;
+        }
+        
         const files = Array.from(e.dataTransfer.files);
         
         if (files.length === 0) {
             return;
         }
         
+        state.selectedPeer = peerId;
         targetPeerId = peerId;
         draggedFiles = files;
         
         // Show drop zone with preview
-        showDropZone(peerId, files);
+        openFilePicker(peerId);
+        handleFileSelection(files, peerId);
+    });
+    
+    // Drop zone drag events for additional files
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.classList.add('drag-active');
+    });
+    
+    dropZone.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.target === dropZone) {
+            dropZone.classList.remove('drag-active');
+        }
+    });
+    
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.classList.remove('drag-active');
+        
+        const files = Array.from(e.dataTransfer.files);
+        if (files.length > 0 && state.selectedPeer) {
+            handleFileSelection(files, state.selectedPeer);
+        }
     });
     
     // Send files button
     sendFilesBtn.addEventListener('click', async () => {
-        if (draggedFiles.length > 0 && targetPeerId) {
-            await sendFiles(targetPeerId, draggedFiles);
+        const peerId = state.selectedPeer;
+        const files = state.pendingFiles.get(peerId);
+        
+        if (files && files.length > 0 && peerId) {
+            await sendFiles(peerId, files);
             hideDropZone();
         }
     });
@@ -1146,54 +1302,13 @@ function setupDragAndDrop() {
         hideDropZone();
     });
     
-    function showDropZone(peerId, files) {
-        const peer = state.peers.get(peerId);
-        const dropTargetName = document.getElementById('dropTargetName');
-        dropTargetName.textContent = peer?.name || 'device';
-        
-        // Clear and populate preview area
-        previewArea.innerHTML = '';
-        
-        files.forEach(file => {
-            const preview = document.createElement('div');
-            preview.className = 'file-preview';
-            
-            if (file.type.startsWith('image/')) {
-                const img = document.createElement('img');
-                img.src = URL.createObjectURL(file);
-                preview.appendChild(img);
-            } else {
-                const icon = document.createElement('div');
-                icon.className = 'file-preview-icon';
-                icon.innerHTML = `
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
-                        <polyline points="13 2 13 9 20 9"></polyline>
-                    </svg>
-                `;
-                preview.appendChild(icon);
-            }
-            
-            const info = document.createElement('div');
-            info.className = 'file-info';
-            info.innerHTML = `
-                <div class="file-name">${file.name}</div>
-                <div class="file-size">${formatFileSize(file.size)}</div>
-            `;
-            preview.appendChild(info);
-            
-            previewArea.appendChild(preview);
-        });
-        
-        sendFilesBtn.style.display = 'inline-block';
-        dropZone.classList.remove('hidden');
-    }
-    
     function hideDropZone() {
         dropZone.classList.add('hidden');
         previewArea.innerHTML = '';
         draggedFiles = [];
         targetPeerId = null;
+        state.selectedPeer = null;
+        state.pendingFiles.clear();
     }
 }
 

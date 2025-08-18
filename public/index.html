@@ -85,15 +85,25 @@
                     <polyline points="7 10 12 15 17 10"></polyline>
                     <line x1="12" y1="15" x2="12" y2="3"></line>
                 </svg>
-                <h3>Drop files here</h3>
+                <h3>Send files</h3>
                 <p>Files will be sent to <span id="dropTargetName">device</span></p>
                 <div id="previewArea" class="preview-area"></div>
                 <div class="drop-zone-actions">
+                    <button id="selectFilesBtn" class="btn btn-secondary">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+                            <polyline points="13 2 13 9 20 9"></polyline>
+                        </svg>
+                        Choose Files
+                    </button>
                     <button id="sendFilesBtn" class="btn btn-primary" style="display: none;">Send Files</button>
                     <button id="cancelDropBtn" class="btn btn-secondary">Cancel</button>
                 </div>
             </div>
         </div>
+        
+        <!-- Hidden file input -->
+        <input type="file" id="fileInput" multiple style="display: none;">
     </div>
 
     <!-- Name Edit Modal -->

@@ -4,6 +4,7 @@ const http = require('http');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const os = require('os');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
@@ -15,6 +16,7 @@ app.use(express.static('public'));
 // Store rooms and clients
 const rooms = new Map(); // roomCode -> Set of clientIds
 const clients = new Map(); // clientId -> clientInfo
+const ipRooms = new Map(); // IP address -> roomCode (for AUTO_ROOM mode)
 
 // Get local IP address
 function getLocalIP() {
@@ -39,6 +41,29 @@ function generateRoomCode() {
   return code;
 }
 
+// Generate room code from IP (for auto-room mode)
+function generateRoomFromIP(ip) {
+  // Clean IP address (remove IPv6 prefix if present)
+  const cleanIP = ip.replace(/^::ffff:/, '');
+  
+  // Create a hash of the IP for privacy
+  const hash = crypto.createHash('sha256').update(cleanIP).digest('hex');
+  
+  // Take first 6 characters and convert to uppercase alphanumeric
+  let roomCode = '';
+  for (let i = 0; i < 6; i++) {
+    const charCode = hash.charCodeAt(i);
+    if (charCode < 58) { // 0-9
+      roomCode += String.fromCharCode(charCode);
+    } else {
+      // Convert to A-Z
+      roomCode += String.fromCharCode(65 + (charCode % 26));
+    }
+  }
+  
+  return roomCode;
+}
+
 // Get clients in room
 function getClientsInRoom(roomCode) {
   const roomClientIds = rooms.get(roomCode);
@@ -48,6 +73,10 @@ function getClientsInRoom(roomCode) {
     .map(id => clients.get(id))
     .filter(client => client !== undefined);
 }
+
+// Check if auto-room mode is enabled
+const AUTO_ROOM_MODE = process.env.AUTO_ROOM === 'true';
+const PUBLIC_DEPLOY = process.env.PUBLIC_DEPLOY === 'true';
 
 // Message size limit for signaling (100KB should be enough for SDP/ICE)
 const MAX_SIGNAL_SIZE = 100 * 1024; // 100KB
@@ -80,12 +109,83 @@ wss.on('connection', (ws, req) => {
   
   console.log(`[Connect] Client ${clientId} connected from ${clientIp}`);
   
-  // Send client their ID (but not peers yet - they need to join a room first)
-  ws.send(JSON.stringify({
-    type: 'init',
-    clientId: clientId,
-    needsRoom: true
-  }));
+  // Auto-join room based on IP if AUTO_ROOM mode is enabled
+  if (AUTO_ROOM_MODE && PUBLIC_DEPLOY) {
+    // Get or create room for this IP
+    let roomCode = ipRooms.get(clientIp);
+    
+    if (!roomCode) {
+      // Generate room code from IP
+      roomCode = generateRoomFromIP(clientIp);
+      ipRooms.set(clientIp, roomCode);
+      
+      // Create room if it doesn't exist
+      if (!rooms.has(roomCode)) {
+        rooms.set(roomCode, new Set());
+        console.log(`[Auto-Room] Created room ${roomCode} for IP ${clientIp}`);
+      }
+    }
+    
+    // Join the room automatically
+    rooms.get(roomCode).add(clientId);
+    clientInfo.roomCode = roomCode;
+    
+    console.log(`[Auto-Room] Client ${clientId} auto-joined room ${roomCode}`);
+    
+    // Get other peers in room
+    const peersInRoom = getClientsInRoom(roomCode)
+      .filter(client => client.id !== clientId)
+      .map(client => ({
+        id: client.id,
+        name: client.name
+      }));
+    
+    // Send init with room info and peers
+    ws.send(JSON.stringify({
+      type: 'init',
+      clientId: clientId,
+      autoRoom: true,
+      roomCode: roomCode,
+      peers: peersInRoom
+    }));
+    
+    // Notify other room members
+    broadcastToRoom(roomCode, clientId, {
+      type: 'peer-joined',
+      peer: {
+        id: clientId,
+        name: clientInfo.name
+      }
+    });
+  } else if (PUBLIC_DEPLOY) {
+    // Manual room mode (default for public deploy)
+    ws.send(JSON.stringify({
+      type: 'init',
+      clientId: clientId,
+      needsRoom: true
+    }));
+  } else {
+    // Local network mode (no rooms)
+    ws.send(JSON.stringify({
+      type: 'init',
+      clientId: clientId,
+      peers: Array.from(clients.entries())
+        .filter(([id]) => id !== clientId)
+        .map(([id, info]) => ({
+          id: id,
+          name: info.name
+        }))
+    }));
+    
+    // Notify other clients about new peer (local mode)
+    broadcast(clientId, {
+      type: 'peer-joined',
+      peer: {
+        id: clientId,
+        name: clientInfo.name
+      }
+    });
+  }
   
   ws.on('message', (data) => {
     try {
@@ -172,19 +272,32 @@ wss.on('connection', (ws, req) => {
       
       switch (message.type) {
         case 'create-room':
-          handleCreateRoom(clientInfo);
+          if (!AUTO_ROOM_MODE && PUBLIC_DEPLOY) {
+            handleCreateRoom(clientInfo);
+          }
           break;
           
         case 'join-room':
-          handleJoinRoom(clientInfo, message.roomCode);
+          if (!AUTO_ROOM_MODE && PUBLIC_DEPLOY) {
+            handleJoinRoom(clientInfo, message.roomCode);
+          }
           break;
           
         case 'set-name':
           clientInfo.name = message.name.slice(0, 30); // Limit name length
           
-          // Broadcast to room members only
-          if (clientInfo.roomCode) {
+          if (PUBLIC_DEPLOY && clientInfo.roomCode) {
+            // Broadcast to room members only (public mode)
             broadcastToRoom(clientInfo.roomCode, clientId, {
+              type: 'peer-updated',
+              peer: {
+                id: clientId,
+                name: clientInfo.name
+              }
+            });
+          } else if (!PUBLIC_DEPLOY) {
+            // Broadcast to all (local mode)
+            broadcast(clientId, {
               type: 'peer-updated',
               peer: {
                 id: clientId,
@@ -197,12 +310,22 @@ wss.on('connection', (ws, req) => {
         case 'offer':
         case 'answer':
         case 'ice-candidate':
-          // Forward signaling messages to target peer (must be in same room)
+          // Forward signaling messages to target peer
           if (message.targetId && clients.has(message.targetId)) {
             const targetClient = clients.get(message.targetId);
             
-            // Check if both clients are in the same room
-            if (targetClient.roomCode === clientInfo.roomCode && clientInfo.roomCode !== null) {
+            // Check room compatibility based on mode
+            let canCommunicate = false;
+            
+            if (!PUBLIC_DEPLOY) {
+              // Local mode - all clients can communicate
+              canCommunicate = true;
+            } else if (targetClient.roomCode === clientInfo.roomCode && clientInfo.roomCode !== null) {
+              // Public mode - must be in same room
+              canCommunicate = true;
+            }
+            
+            if (canCommunicate) {
               targetClient.ws.send(JSON.stringify({
                 ...message,
                 fromId: clientId,
@@ -211,8 +334,8 @@ wss.on('connection', (ws, req) => {
             } else {
               ws.send(JSON.stringify({
                 type: 'error',
-                message: 'Target peer not in same room',
-                code: 'PEER_NOT_IN_ROOM'
+                message: 'Target peer not accessible',
+                code: 'PEER_NOT_ACCESSIBLE'
               }));
             }
           }
@@ -233,6 +356,12 @@ wss.on('connection', (ws, req) => {
     // Leave room if in one
     if (clientInfo.roomCode) {
       leaveRoom(clientId, clientInfo.roomCode);
+    } else if (!PUBLIC_DEPLOY) {
+      // Notify other clients in local mode
+      broadcast(clientId, {
+        type: 'peer-left',
+        peerId: clientId
+      });
     }
     
     clients.delete(clientId);
@@ -357,7 +486,6 @@ app.get('/api/info', (req, res) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   const localIP = getLocalIP();
-  const isPublic = process.env.PUBLIC_DEPLOY === 'true';
   
   console.log('');
   console.log('🚀 Local File Transfer Server Started');
@@ -365,13 +493,21 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`📡 Local:    http://localhost:${PORT}`);
   console.log(`🌐 Network:  http://${localIP}:${PORT}`);
   console.log('=====================================');
-  if (isPublic) {
-    console.log('🌍 Running in PUBLIC mode - Room codes required');
-    console.log('📝 Users must create/join rooms to connect');
+  
+  if (PUBLIC_DEPLOY) {
+    if (AUTO_ROOM_MODE) {
+      console.log('🌍 Running in PUBLIC mode with AUTO-ROOM');
+      console.log('🔐 Users from same network auto-join same room');
+      console.log('📝 Room codes are generated from IP addresses');
+    } else {
+      console.log('🌍 Running in PUBLIC mode with MANUAL ROOMS');
+      console.log('📝 Users must create/join rooms to connect');
+    }
   } else {
     console.log('🏠 Running in LOCAL mode');
     console.log('📱 Open this URL on all devices in the same network');
   }
+  
   console.log('🔒 All file transfers are P2P (not through server)');
   console.log('');
 });
