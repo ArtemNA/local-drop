@@ -4,7 +4,9 @@ const CONFIG = {
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' }
     ],
-    chunkSize: 16384, // 16KB chunks for DataChannel
+    chunkSize: 64 * 1024, // 64KB chunks for better performance
+    bufferThreshold: 8 * 1024 * 1024, // 8MB buffer threshold (lowered for stability)
+    bufferCheckInterval: 25, // Check buffer every 25ms
     reconnectDelay: 3000,
     reconnectMaxAttempts: 5,
     pingInterval: 30000,
@@ -237,7 +239,13 @@ function showRoomInfo(roomCode) {
 async function createConnection(peerId, isInitiator = true) {
     console.log(`Creating connection to ${peerId}, initiator: ${isInitiator}`);
     
-    const connection = new RTCPeerConnection({ iceServers: CONFIG.iceServers });
+    const connection = new RTCPeerConnection({ 
+        iceServers: CONFIG.iceServers,
+        // Optional: Add more aggressive settings for better performance
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require'
+    });
+    
     state.connections.set(peerId, connection);
     
     // Handle ICE candidates
@@ -266,7 +274,10 @@ async function createConnection(peerId, isInitiator = true) {
     if (isInitiator) {
         const dataChannel = connection.createDataChannel('fileTransfer', {
             ordered: true,
-            maxRetransmits: 3
+            // Increase buffer size for better performance with large files
+            maxPacketLifeTime: 3000,
+            // Use larger buffer for file transfers
+            protocol: 'binary'
         });
         
         setupDataChannel(dataChannel, peerId);
@@ -465,7 +476,7 @@ async function startFileSend(transfer) {
     transfer.startTime = Date.now();
     updateTransferUI(transfer);
     
-    // Send file metadata
+    // Send file metadata as JSON
     const metadata = {
         type: 'file-start',
         transferId: transfer.id,
@@ -475,16 +486,16 @@ async function startFileSend(transfer) {
         lastModified: transfer.file.lastModified
     };
     
-    dataChannel.send(JSON.stringify(metadata));
+    await sendWithFlowControl(dataChannel, JSON.stringify(metadata));
     
     // Read and send file in chunks
     const reader = new FileReader();
     let offset = transfer.bytesTransferred;
     
-    const readNextChunk = () => {
+    const readNextChunk = async () => {
         if (offset >= transfer.file.size) {
-            // File transfer complete
-            dataChannel.send(JSON.stringify({
+            // File transfer complete - send as JSON
+            await sendWithFlowControl(dataChannel, JSON.stringify({
                 type: 'file-end',
                 transferId: transfer.id
             }));
@@ -503,30 +514,40 @@ async function startFileSend(transfer) {
         reader.readAsArrayBuffer(chunk);
     };
     
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
         if (dataChannel.readyState !== 'open') {
             transfer.status = 'paused';
             updateTransferUI(transfer);
             return;
         }
         
-        // Send chunk with metadata
-        const chunkData = {
-            type: 'file-chunk',
-            transferId: transfer.id,
-            offset: offset,
-            data: Array.from(new Uint8Array(event.target.result))
-        };
-        
-        dataChannel.send(JSON.stringify(chunkData));
-        
-        offset += event.target.result.byteLength;
-        transfer.bytesTransferred = offset;
-        transfer.progress = (offset / transfer.file.size) * 100;
-        updateTransferUI(transfer);
-        
-        // Continue reading
-        setTimeout(readNextChunk, 0);
+        try {
+            // Send chunk metadata first (as JSON)
+            const chunkMeta = {
+                type: 'file-chunk-meta',
+                transferId: transfer.id,
+                offset: offset,
+                size: event.target.result.byteLength
+            };
+            
+            await sendWithFlowControl(dataChannel, JSON.stringify(chunkMeta));
+            
+            // Then send actual binary data
+            await sendWithFlowControl(dataChannel, event.target.result);
+            
+            offset += event.target.result.byteLength;
+            transfer.bytesTransferred = offset;
+            transfer.progress = (offset / transfer.file.size) * 100;
+            updateTransferUI(transfer);
+            
+            // Continue reading with a small delay
+            setTimeout(readNextChunk, 0);
+        } catch (error) {
+            console.error('Error sending chunk:', error);
+            transfer.status = 'failed';
+            updateTransferUI(transfer);
+            showToast(`Failed to send ${transfer.file.name}`, 'error');
+        }
     };
     
     reader.onerror = () => {
@@ -538,8 +559,54 @@ async function startFileSend(transfer) {
     readNextChunk();
 }
 
+// Send data with flow control to prevent buffer overflow
+async function sendWithFlowControl(dataChannel, data) {
+    const maxBufferAmount = CONFIG.bufferThreshold;
+    const checkInterval = CONFIG.bufferCheckInterval;
+    
+    return new Promise((resolve, reject) => {
+        const send = () => {
+            try {
+                // Check if buffer is too full
+                if (dataChannel.bufferedAmount > maxBufferAmount) {
+                    // Wait and check again
+                    setTimeout(send, checkInterval);
+                    return;
+                }
+                
+                // Check if channel is still open
+                if (dataChannel.readyState !== 'open') {
+                    reject(new Error('DataChannel is not open'));
+                    return;
+                }
+                
+                // Send the data
+                dataChannel.send(data);
+                
+                // For large binary data, wait a bit for buffer to clear
+                if (data instanceof ArrayBuffer && data.byteLength > 1024) {
+                    setTimeout(resolve, 10);
+                } else {
+                    resolve();
+                }
+            } catch (error) {
+                reject(error);
+            }
+        };
+        
+        send();
+    });
+}
+
 // Handle incoming data channel messages
 function handleDataChannelMessage(event, peerId) {
+    // Handle binary data (file chunks)
+    if (event.data instanceof ArrayBuffer) {
+        handleBinaryData(event.data, peerId);
+        return;
+    }
+    
+    // Handle JSON messages
     try {
         const message = JSON.parse(event.data);
         
@@ -548,7 +615,12 @@ function handleDataChannelMessage(event, peerId) {
                 handleFileStart(message, peerId);
                 break;
                 
+            case 'file-chunk-meta':
+                handleFileChunkMeta(message, peerId);
+                break;
+                
             case 'file-chunk':
+                // Legacy format (for backwards compatibility)
                 handleFileChunk(message, peerId);
                 break;
                 
@@ -569,6 +641,27 @@ function handleDataChannelMessage(event, peerId) {
     }
 }
 
+// Handle binary data (actual file chunks)
+function handleBinaryData(data, peerId) {
+    // Find the active transfer waiting for binary data
+    for (const [transferId, transfer] of state.activeTransfers) {
+        if (transfer.peerId === peerId && 
+            transfer.direction === 'receive' && 
+            transfer.expectingBinary) {
+            
+            // Store the binary chunk
+            const chunkData = new Uint8Array(data);
+            transfer.chunks.push(chunkData);
+            transfer.bytesReceived += chunkData.byteLength;
+            transfer.progress = (transfer.bytesReceived / transfer.fileSize) * 100;
+            transfer.expectingBinary = false;
+            
+            updateTransferUI(transfer);
+            break;
+        }
+    }
+}
+
 // Handle incoming file start
 function handleFileStart(message, peerId) {
     const transfer = {
@@ -582,7 +675,8 @@ function handleFileStart(message, peerId) {
         bytesReceived: 0,
         status: 'receiving',
         startTime: Date.now(),
-        chunks: []
+        chunks: [],
+        expectingBinary: false
     };
     
     state.activeTransfers.set(message.transferId, transfer);
@@ -591,7 +685,20 @@ function handleFileStart(message, peerId) {
     showToast(`Receiving ${message.name} from ${state.peers.get(peerId)?.name || 'device'}`, 'info');
 }
 
-// Handle incoming file chunk
+// Handle file chunk metadata
+function handleFileChunkMeta(message, peerId) {
+    const transfer = state.activeTransfers.get(message.transferId);
+    
+    if (!transfer) {
+        console.error('Transfer not found:', message.transferId);
+        return;
+    }
+    
+    // Mark that we're expecting binary data next
+    transfer.expectingBinary = true;
+}
+
+// Handle incoming file chunk (legacy JSON format)
 function handleFileChunk(message, peerId) {
     const transfer = state.activeTransfers.get(message.transferId);
     
@@ -851,12 +958,14 @@ function addTransferToUI(transfer) {
                 <div class="transfer-details">
                     ${transfer.direction === 'send' ? 'To' : 'From'} ${peerName} • ${formatFileSize(fileSize)}
                 </div>
+                <div class="transfer-speed" id="speed-${transfer.id}"></div>
             </div>
             <div class="transfer-status ${transfer.status}">${transfer.status}</div>
         </div>
         <div class="progress-bar">
             <div class="progress-fill" style="width: ${transfer.progress}%"></div>
         </div>
+        <div class="progress-text" id="progress-${transfer.id}">0% • 0 B / ${formatFileSize(fileSize)}</div>
         <div class="transfer-actions">
             ${transfer.status === 'paused' ? 
                 `<button onclick="resumeTransfer('${transfer.id}')">Resume</button>` : ''}
@@ -879,11 +988,29 @@ function updateTransferUI(transfer) {
     
     const statusElement = transferItem.querySelector('.transfer-status');
     const progressFill = transferItem.querySelector('.progress-fill');
+    const progressText = document.getElementById(`progress-${transfer.id}`);
+    const speedElement = document.getElementById(`speed-${transfer.id}`);
     const actionsDiv = transferItem.querySelector('.transfer-actions');
     
     statusElement.className = `transfer-status ${transfer.status}`;
     statusElement.textContent = transfer.status;
     progressFill.style.width = `${transfer.progress}%`;
+    
+    // Update progress text
+    const transferred = transfer.bytesTransferred || transfer.bytesReceived || 0;
+    const total = transfer.file?.size || transfer.fileSize || 0;
+    progressText.textContent = `${Math.round(transfer.progress)}% • ${formatFileSize(transferred)} / ${formatFileSize(total)}`;
+    
+    // Calculate and show speed
+    if (transfer.startTime && (transfer.status === 'sending' || transfer.status === 'receiving')) {
+        const elapsed = (Date.now() - transfer.startTime) / 1000; // seconds
+        const speed = transferred / elapsed; // bytes per second
+        const remaining = (total - transferred) / speed; // seconds
+        
+        speedElement.textContent = `${formatFileSize(speed)}/s • ${formatTime(remaining)} remaining`;
+    } else {
+        speedElement.textContent = '';
+    }
     
     // Update actions
     let actionsHTML = '';
@@ -898,6 +1025,23 @@ function updateTransferUI(transfer) {
     }
     
     actionsDiv.innerHTML = actionsHTML;
+}
+
+// Format time in seconds to readable format
+function formatTime(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '...';
+    
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+    
+    if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+    } else if (minutes > 0) {
+        return `${minutes}m ${secs}s`;
+    } else {
+        return `${secs}s`;
+    }
 }
 
 function removeTransferFromUI(transferId) {

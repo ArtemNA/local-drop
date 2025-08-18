@@ -449,6 +449,13 @@ h2 {
     color: var(--text-secondary);
 }
 
+.transfer-speed {
+    font-size: 0.75rem;
+    color: var(--primary-color);
+    margin-top: 4px;
+    font-weight: 500;
+}
+
 .transfer-status {
     padding: 4px 12px;
     border-radius: 12px;
@@ -487,7 +494,7 @@ h2 {
     background: var(--border-color);
     border-radius: 4px;
     overflow: hidden;
-    margin-bottom: 8px;
+    margin: 12px 0 8px;
 }
 
 .progress-fill {
@@ -495,6 +502,12 @@ h2 {
     background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
     border-radius: 4px;
     transition: width 0.3s;
+}
+
+.progress-text {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
 }
 
 .transfer-actions {
