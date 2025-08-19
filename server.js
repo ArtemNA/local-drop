@@ -568,6 +568,24 @@ app.get('/api/info', (req, res) => {
   });
 });
 
+app.get('/live', (req, res) => {
+  const text = new Date().toISOString();
+  res.json({ text });
+});
+
+function keepAlive() {
+  https.get('https://local-drop.onrender.com/live', (res) => {
+    //console.log(res)
+    res.on('data', () => {});
+    res.on('end', () => {});
+  }).on('error', (err) => {
+    console.log('Error: ', err.message);
+  });
+}
+
+// Run the keep-alive function every 14 minutes
+setInterval(keepAlive, 4 * 60 * 1000);
+
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
