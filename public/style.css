@@ -1,10 +1,26 @@
+/* All elements transitions for smooth theme switching */
 * {
     margin: 0;
     padding: 0;
     box-sizing: border-box;
 }
 
-:root {
+/* Smooth transitions for theme switching */
+header,
+.room-section,
+.devices-section,
+.queue-section,
+.device-card,
+.modal-content,
+.drop-zone-content,
+.toast,
+.btn,
+input {
+    transition: background-color 0.3s, color 0.3s, border-color 0.3s;
+}
+
+/* Light theme variables */
+[data-theme="light"] {
     --primary-color: #4CAF50;
     --primary-dark: #388E3C;
     --secondary-color: #2196F3;
@@ -18,16 +34,45 @@
     --shadow-sm: 0 2px 4px rgba(0,0,0,0.1);
     --shadow-md: 0 4px 6px rgba(0,0,0,0.1);
     --shadow-lg: 0 10px 20px rgba(0,0,0,0.1);
+    --body-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    --modal-bg: rgba(0, 0, 0, 0.5);
+    --drop-zone-bg: rgba(0, 0, 0, 0.8);
+}
+
+/* Dark theme variables (default) */
+:root,
+[data-theme="dark"] {
+    --primary-color: #66BB6A;
+    --primary-dark: #4CAF50;
+    --secondary-color: #42A5F5;
+    --danger-color: #ef5350;
+    --warning-color: #FFA726;
+    --bg-color: #1a1a1a;
+    --card-bg: #242424;
+    --text-primary: #e0e0e0;
+    --text-secondary: #9e9e9e;
+    --border-color: #404040;
+    --shadow-sm: 0 2px 4px rgba(0,0,0,0.3);
+    --shadow-md: 0 4px 6px rgba(0,0,0,0.4);
+    --shadow-lg: 0 10px 20px rgba(0,0,0,0.5);
+    --body-gradient: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
+    --modal-bg: rgba(0, 0, 0, 0.7);
+    --drop-zone-bg: rgba(0, 0, 0, 0.9);
+}
+
+/* Common variables */
+:root {
     --radius: 8px;
     --radius-lg: 12px;
 }
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: var(--body-gradient);
     min-height: 100vh;
     color: var(--text-primary);
     line-height: 1.6;
+    transition: background 0.3s, color 0.3s;
 }
 
 .container {
@@ -114,6 +159,63 @@ h1 {
     gap: 16px;
 }
 
+/* Theme Switcher */
+.theme-switcher {
+    position: relative;
+    width: 60px;
+    height: 30px;
+    background: var(--border-color);
+    border-radius: 15px;
+    cursor: pointer;
+    transition: background 0.3s;
+    border: 1px solid var(--border-color);
+}
+
+.theme-switcher-toggle {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 22px;
+    height: 22px;
+    background: var(--card-bg);
+    border-radius: 50%;
+    transition: transform 0.3s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.theme-switcher[data-theme="dark"] .theme-switcher-toggle {
+    transform: translateX(0);
+}
+
+.theme-switcher[data-theme="light"] .theme-switcher-toggle {
+    transform: translateX(30px);
+}
+
+.theme-icon {
+    width: 14px;
+    height: 14px;
+    fill: var(--text-primary);
+}
+
+.theme-icon.sun {
+    display: none;
+}
+
+.theme-icon.moon {
+    display: block;
+}
+
+[data-theme="light"] .theme-icon.sun {
+    display: block;
+}
+
+[data-theme="light"] .theme-icon.moon {
+    display: none;
+}
+
 /* Room Section */
 .room-section {
     background: var(--card-bg);
@@ -154,6 +256,8 @@ h1 {
     text-align: center;
     letter-spacing: 2px;
     font-weight: 600;
+    background: var(--card-bg);
+    color: var(--text-primary);
 }
 
 .room-input-group input:focus {
@@ -311,7 +415,7 @@ h2 {
     height: 48px;
     margin: 0 auto 12px;
     padding: 12px;
-    background: white;
+    background: var(--card-bg);
     border-radius: 50%;
     box-shadow: var(--shadow-sm);
 }
@@ -360,7 +464,7 @@ h2 {
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.8);
+    background: var(--drop-zone-bg);
     backdrop-filter: blur(10px);
     display: flex;
     align-items: center;
@@ -374,7 +478,7 @@ h2 {
 }
 
 .drop-zone-content {
-    background: white;
+    background: var(--card-bg);
     border-radius: var(--radius-lg);
     padding: 48px;
     max-width: 500px;
@@ -427,7 +531,7 @@ h2 {
     display: flex;
     align-items: center;
     justify-content: center;
-    background: white;
+    background: var(--card-bg);
     border-radius: 4px;
 }
 
@@ -613,7 +717,7 @@ h2 {
 }
 
 .btn-secondary:hover {
-    background: white;
+    background: var(--card-bg);
     border-color: var(--primary-color);
 }
 
@@ -624,7 +728,7 @@ h2 {
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--modal-bg);
     backdrop-filter: blur(5px);
     display: flex;
     align-items: center;
@@ -637,7 +741,7 @@ h2 {
 }
 
 .modal-content {
-    background: white;
+    background: var(--card-bg);
     border-radius: var(--radius-lg);
     padding: 32px;
     max-width: 400px;
@@ -656,6 +760,8 @@ h2 {
     border-radius: var(--radius);
     font-size: 1rem;
     margin-bottom: 24px;
+    background: var(--bg-color);
+    color: var(--text-primary);
 }
 
 .modal-content input:focus {
@@ -678,7 +784,7 @@ h2 {
 }
 
 .toast {
-    background: white;
+    background: var(--card-bg);
     border-radius: var(--radius);
     padding: 16px 20px;
     margin-bottom: 12px;
@@ -778,6 +884,24 @@ body.dragging .device-card:not(.drag-over) {
     
     .drop-zone-actions .btn {
         width: 100%;
+    }
+    
+    /* Compact header controls on mobile */
+    .status-bar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    
+    .header-controls {
+        justify-content: space-between;
+    }
+    
+    .device-name-btn span {
+        display: none;
+    }
+    
+    .device-name-btn {
+        padding: 8px;
     }
 }
 

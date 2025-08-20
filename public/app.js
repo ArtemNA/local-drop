@@ -73,6 +73,9 @@ async function getLocalIP() {
 
 // Initialize application
 document.addEventListener('DOMContentLoaded', async () => {
+    // Initialize theme
+    initializeTheme();
+    
     // Try to detect local IP for auto-room feature
     state.localIP = await getLocalIP();
     console.log('Detected local IP:', state.localIP);
@@ -82,6 +85,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupEventListeners();
     setupDragAndDrop();
 });
+
+// Theme management
+function initializeTheme() {
+    const savedTheme = localStorage.getItem('theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    
+    const themeSwitcher = document.getElementById('themeSwitcher');
+    if (themeSwitcher) {
+        themeSwitcher.setAttribute('data-theme', savedTheme);
+        
+        themeSwitcher.addEventListener('click', () => {
+            const currentTheme = document.documentElement.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            
+            document.documentElement.setAttribute('data-theme', newTheme);
+            themeSwitcher.setAttribute('data-theme', newTheme);
+            localStorage.setItem('theme', newTheme);
+        });
+    }
+}
 
 // WebSocket connection
 function initializeWebSocket() {
