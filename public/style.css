@@ -3,6 +3,7 @@
     margin: 0;
     padding: 0;
     box-sizing: border-box;
+    user-select: none;
 }
 
 /* Smooth transitions for theme switching */
@@ -20,7 +21,7 @@ input {
 }
 
 /* Light theme variables */
-[data-theme="light"] {
+:root[data-theme="light"] {
     --primary-color: #4CAF50;
     --primary-dark: #388E3C;
     --secondary-color: #2196F3;
@@ -40,24 +41,23 @@ input {
 }
 
 /* Dark theme variables (default) */
-:root,
-[data-theme="dark"] {
+:root {
     --primary-color: #66BB6A;
     --primary-dark: #4CAF50;
     --secondary-color: #42A5F5;
     --danger-color: #ef5350;
     --warning-color: #FFA726;
-    --bg-color: #1a1a1a;
-    --card-bg: #242424;
+    --bg-color: #2d2d3e;
+    --card-bg: #363648;
     --text-primary: #e0e0e0;
-    --text-secondary: #9e9e9e;
-    --border-color: #404040;
+    --text-secondary: #a0a0a0;
+    --border-color: #484860;
     --shadow-sm: 0 2px 4px rgba(0,0,0,0.3);
     --shadow-md: 0 4px 6px rgba(0,0,0,0.4);
     --shadow-lg: 0 10px 20px rgba(0,0,0,0.5);
-    --body-gradient: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
-    --modal-bg: rgba(0, 0, 0, 0.7);
-    --drop-zone-bg: rgba(0, 0, 0, 0.9);
+    --body-gradient: linear-gradient(135deg, #1c0e42 0%, #353557 100%);
+    --modal-bg: rgba(20, 20, 30, 0.8);
+    --drop-zone-bg: rgba(20, 20, 30, 0.95);
 }
 
 /* Common variables */
@@ -146,11 +146,16 @@ h1 {
     border-radius: var(--radius);
     cursor: pointer;
     transition: all 0.3s;
+    color: var(--text-primary);
 }
 
 .device-name-btn:hover {
     background: var(--bg-color);
     border-color: var(--primary-color);
+}
+
+.device-name-btn svg {
+    stroke: currentColor;
 }
 
 .header-controls {
@@ -171,6 +176,10 @@ h1 {
     border: 1px solid var(--border-color);
 }
 
+.theme-switcher:hover {
+    background: var(--bg-color);
+}
+
 .theme-switcher-toggle {
     position: absolute;
     top: 3px;
@@ -186,11 +195,11 @@ h1 {
     box-shadow: 0 2px 4px rgba(0,0,0,0.2);
 }
 
-.theme-switcher[data-theme="dark"] .theme-switcher-toggle {
+[data-theme="dark"] .theme-switcher-toggle {
     transform: translateX(0);
 }
 
-.theme-switcher[data-theme="light"] .theme-switcher-toggle {
+[data-theme="light"] .theme-switcher-toggle {
     transform: translateX(30px);
 }
 
