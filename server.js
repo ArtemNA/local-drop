@@ -558,6 +558,9 @@ function broadcastToRoom(roomCode, senderId, message) {
   });
 }
 
+const SERVER_START_TIME = new Date().toISOString();
+const APP_VERSION = '2.1.0';
+
 // API endpoint to get server info
 app.get('/api/info', (req, res) => {
   res.json({
@@ -565,6 +568,14 @@ app.get('/api/info', (req, res) => {
     totalRooms: rooms.size,
     isPublicDeployment: PUBLIC_DEPLOY,
     autoRoomEnabled: AUTO_ROOM_MODE
+  });
+});
+
+// Version endpoint — returns version + exact server start time
+app.get('/api/version', (req, res) => {
+  res.json({
+    version: APP_VERSION,
+    startedAt: SERVER_START_TIME
   });
 });
 

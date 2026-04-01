@@ -84,6 +84,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initializeWebSocket();
     setupEventListeners();
     setupDragAndDrop();
+    loadVersionInfo();
 });
 
 // Theme management
@@ -1770,6 +1771,23 @@ function stopPingInterval() {
     if (pingInterval) {
         clearInterval(pingInterval);
         pingInterval = null;
+    }
+}
+
+// Fetch and display version info
+async function loadVersionInfo() {
+    try {
+        const res = await fetch('/api/version');
+        const data = await res.json();
+        const el = document.getElementById('appVersion');
+        if (el && data.version) {
+            const d = new Date(data.startedAt);
+            const pad = n => String(n).padStart(2, '0');
+            const stamp = `${d.getFullYear()}.${pad(d.getMonth()+1)}.${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+            el.textContent = `v${data.version} · deploy ${stamp}`;
+        }
+    } catch (e) {
+        // silent — footer keeps the static fallback
     }
 }
 
