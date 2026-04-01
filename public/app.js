@@ -4,13 +4,12 @@ const CONFIG = {
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' }
     ],
-    chunkSize: 256 * 1024, // 64KB chunks for better performance
-    bufferThreshold: 64 * 1024 * 1024, // 8MB buffer threshold (lowered for stability)
-    bufferCheckInterval: 25, // Check buffer every 25ms
+    chunkSize: 1 * 1024 * 1024, // 1MB chunks for better throughput
+    bufferThreshold: 2 * 1024 * 1024, // 2MB buffer threshold (under browser ~16MB limit)
     reconnectDelay: 3000,
     reconnectMaxAttempts: 5,
     pingInterval: 30000,
-    fileTransferTimeout: 300000 // 5 minutes
+    inactivityTimeout: 60000 // 60 seconds of no chunk activity = stalled
 };
 
 // Application state
@@ -29,7 +28,8 @@ const state = {
     selectedPeer: null,
     reconnectAttempts: 0,
     isReconnecting: false,
-    localIP: null
+    localIP: null,
+    peerLocality: new Map() // peerId -> 'verified' | 'confirmed' | 'blocked'
 };
 
 // Get local IP address using WebRTC
@@ -375,22 +375,20 @@ async function createConnection(peerId, isInitiator = true) {
     // Monitor connection state
     connection.onconnectionstatechange = () => {
         console.log(`Connection state with ${peerId}: ${connection.connectionState}`);
-        
+
         if (connection.connectionState === 'failed' || connection.connectionState === 'disconnected') {
             handleConnectionFailure(peerId);
         } else if (connection.connectionState === 'connected') {
             showToast(`Connected to ${state.peers.get(peerId)?.name || 'device'}`, 'success');
+            // Verify locality of the connection
+            verifyLocality(connection, peerId);
         }
     };
     
     // Create data channel only if initiator
     if (isInitiator) {
         const dataChannel = connection.createDataChannel('fileTransfer', {
-            ordered: true,
-            // Increase buffer size for better performance with large files
-            maxPacketLifeTime: 3000,
-            // Use larger buffer for file transfers
-            protocol: 'binary'
+            ordered: true
         });
         
         setupDataChannel(dataChannel, peerId);
@@ -519,14 +517,168 @@ async function connectToPeer(peerId) {
     }
 }
 
+// Locality verification
+function isPrivateIP(ip) {
+    if (!ip) return false;
+    // IPv4 private ranges
+    if (/^10\./.test(ip)) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;
+    if (/^192\.168\./.test(ip)) return true;
+    if (/^169\.254\./.test(ip)) return true; // link-local
+    // IPv6 private
+    if (/^fd[0-9a-f]{2}:/i.test(ip)) return true;
+    if (/^fe80:/i.test(ip)) return true; // link-local
+    return false;
+}
+
+function getSubnet24(ip) {
+    if (!ip) return null;
+    const parts = ip.split('.');
+    if (parts.length === 4) return parts.slice(0, 3).join('.');
+    return null;
+}
+
+async function verifyLocality(connection, peerId) {
+    try {
+        const stats = await connection.getStats();
+        let localCandidateType = null;
+        let remoteCandidateType = null;
+        let localIP = null;
+        let remoteIP = null;
+        let selectedPairFound = false;
+
+        stats.forEach(report => {
+            if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
+                selectedPairFound = true;
+                // Find local and remote candidates
+                stats.forEach(r => {
+                    if (r.id === report.localCandidateId) {
+                        localCandidateType = r.candidateType;
+                        localIP = r.address || r.ip;
+                    }
+                    if (r.id === report.remoteCandidateId) {
+                        remoteCandidateType = r.candidateType;
+                        remoteIP = r.address || r.ip;
+                    }
+                });
+            }
+        });
+
+        if (!selectedPairFound) {
+            // Fallback: check all succeeded pairs
+            stats.forEach(report => {
+                if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                    stats.forEach(r => {
+                        if (r.id === report.localCandidateId) {
+                            localCandidateType = r.candidateType;
+                            localIP = r.address || r.ip;
+                        }
+                        if (r.id === report.remoteCandidateId) {
+                            remoteCandidateType = r.candidateType;
+                            remoteIP = r.address || r.ip;
+                        }
+                    });
+                }
+            });
+        }
+
+        console.log(`Locality check for ${peerId}: local=${localCandidateType}(${localIP}), remote=${remoteCandidateType}(${remoteIP})`);
+
+        // Check for relay - block
+        if (localCandidateType === 'relay' || remoteCandidateType === 'relay') {
+            state.peerLocality.set(peerId, 'blocked');
+            showToast('Connection uses relay - file transfer blocked (not local)', 'error');
+            updateDevicesList();
+            return;
+        }
+
+        // Check for verified local: both host candidates with private IPs
+        if (localCandidateType === 'host' && remoteCandidateType === 'host' &&
+            isPrivateIP(localIP) && isPrivateIP(remoteIP)) {
+            state.peerLocality.set(peerId, 'verified');
+            updateDevicesList();
+            return;
+        }
+
+        // Additional check: same subnet via localIP hints
+        if (state.localIP && isPrivateIP(localIP) && isPrivateIP(remoteIP)) {
+            const localSubnet = getSubnet24(localIP);
+            const remoteSubnet = getSubnet24(remoteIP);
+            if (localSubnet && remoteSubnet && localSubnet === remoteSubnet) {
+                state.peerLocality.set(peerId, 'verified');
+                updateDevicesList();
+                return;
+            }
+        }
+
+        // Unverified direct route - will need user confirmation before transfer
+        state.peerLocality.set(peerId, 'unverified');
+        updateDevicesList();
+
+    } catch (err) {
+        console.error('Error verifying locality:', err);
+        // On error, mark as unverified rather than blocking
+        state.peerLocality.set(peerId, 'unverified');
+        updateDevicesList();
+    }
+}
+
+async function checkLocalityBeforeTransfer(peerId) {
+    const locality = state.peerLocality.get(peerId);
+
+    if (locality === 'verified' || locality === 'confirmed') {
+        return true;
+    }
+
+    if (locality === 'blocked') {
+        showToast('Transfer blocked: connection route is not local (relay detected)', 'error');
+        return false;
+    }
+
+    // Unverified or unknown - ask user
+    return new Promise(resolve => {
+        const peerName = state.peers.get(peerId)?.name || 'device';
+        const dialog = document.createElement('div');
+        dialog.className = 'locality-dialog';
+        dialog.innerHTML = `
+            <div class="locality-dialog-overlay"></div>
+            <div class="locality-dialog-content">
+                <h3>Unverified Route</h3>
+                <p>The connection to <strong>${peerName}</strong> could not be verified as local. If you are sure both devices are on the same network, you can proceed.</p>
+                <div class="locality-dialog-actions">
+                    <button class="locality-btn-cancel">Cancel</button>
+                    <button class="locality-btn-confirm">Transfer Anyway</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(dialog);
+
+        dialog.querySelector('.locality-btn-cancel').onclick = () => {
+            dialog.remove();
+            resolve(false);
+        };
+        dialog.querySelector('.locality-btn-confirm').onclick = () => {
+            state.peerLocality.set(peerId, 'confirmed');
+            updateDevicesList();
+            dialog.remove();
+            resolve(true);
+        };
+        dialog.querySelector('.locality-dialog-overlay').onclick = () => {
+            dialog.remove();
+            resolve(false);
+        };
+    });
+}
+
 // File transfer functions
 async function sendFiles(peerId, files) {
     const dataChannel = state.dataChannels.get(peerId);
-    
+
     if (!dataChannel || dataChannel.readyState !== 'open') {
         showToast('Connection not ready. Establishing connection...', 'warning');
         await connectToPeer(peerId);
-        
+
         // Wait for connection
         setTimeout(() => {
             const dc = state.dataChannels.get(peerId);
@@ -536,6 +688,13 @@ async function sendFiles(peerId, files) {
                 showToast('Failed to establish connection', 'error');
             }
         }, 3000);
+        return;
+    }
+
+    // Locality check after connection is established (verifyLocality runs on 'connected')
+    const localityOk = await checkLocalityBeforeTransfer(peerId);
+    if (!localityOk) {
+        showToast('Transfer cancelled: route not verified as local', 'warning');
         return;
     }
     
@@ -589,72 +748,76 @@ async function startFileSend(transfer) {
     transfer.startTime = Date.now();
     updateTransferUI(transfer);
     
-    // Send file metadata as JSON
+    // Send file metadata as JSON (includes chunkSize so receiver knows boundaries)
     const metadata = {
         type: 'file-start',
         transferId: transfer.id,
         name: transfer.file.name,
         size: transfer.file.size,
         mimeType: transfer.file.type,
-        lastModified: transfer.file.lastModified
+        lastModified: transfer.file.lastModified,
+        chunkSize: CONFIG.chunkSize
     };
-    
+
     await sendWithFlowControl(dataChannel, JSON.stringify(metadata));
-    
-    // Read and send file in chunks
+
+    // Track inactivity for timeout
+    transfer.lastActivity = Date.now();
+
+    // Read and send file in chunks (no per-chunk JSON metadata)
     const reader = new FileReader();
     let offset = transfer.bytesTransferred;
-    
+
     const readNextChunk = async () => {
         if (offset >= transfer.file.size) {
-            // File transfer complete - send as JSON
+            // File transfer complete
             await sendWithFlowControl(dataChannel, JSON.stringify({
                 type: 'file-end',
-                transferId: transfer.id
+                transferId: transfer.id,
+                totalBytes: offset
             }));
-            
+
             transfer.status = 'completed';
             updateTransferUI(transfer);
             showToast(`Sent ${transfer.file.name}`, 'success');
             return;
         }
-        
+
         if (transfer.status === 'paused' || transfer.status === 'cancelled') {
             return;
         }
-        
+
+        // Inactivity timeout check
+        if (Date.now() - transfer.lastActivity > CONFIG.inactivityTimeout) {
+            transfer.status = 'failed';
+            updateTransferUI(transfer);
+            showToast(`Transfer timed out: ${transfer.file.name}`, 'error');
+            return;
+        }
+
         const chunk = transfer.file.slice(offset, offset + CONFIG.chunkSize);
         reader.readAsArrayBuffer(chunk);
     };
-    
+
     reader.onload = async (event) => {
         if (dataChannel.readyState !== 'open') {
             transfer.status = 'paused';
             updateTransferUI(transfer);
             return;
         }
-        
+
         try {
-            // Send chunk metadata first (as JSON)
-            const chunkMeta = {
-                type: 'file-chunk-meta',
-                transferId: transfer.id,
-                offset: offset,
-                size: event.target.result.byteLength
-            };
-            
-            await sendWithFlowControl(dataChannel, JSON.stringify(chunkMeta));
-            
-            // Then send actual binary data
+            // Send only binary data (no per-chunk JSON metadata)
             await sendWithFlowControl(dataChannel, event.target.result);
-            
+
             offset += event.target.result.byteLength;
             transfer.bytesTransferred = offset;
             transfer.progress = (offset / transfer.file.size) * 100;
+            transfer.lastActivity = Date.now();
             updateTransferUI(transfer);
-            
-            // Continue reading with a small delay
-            setTimeout(readNextChunk, 0);
+
+            // Continue reading immediately
+            queueMicrotask(readNextChunk);
         } catch (error) {
             console.error('Error sending chunk:', error);
             transfer.status = 'failed';
@@ -662,53 +825,37 @@ async function startFileSend(transfer) {
             showToast(`Failed to send ${transfer.file.name}`, 'error');
         }
     };
-    
+
     reader.onerror = () => {
         transfer.status = 'failed';
         updateTransferUI(transfer);
         showToast(`Failed to send ${transfer.file.name}`, 'error');
     };
-    
+
     readNextChunk();
 }
 
 // Send data with flow control to prevent buffer overflow
 async function sendWithFlowControl(dataChannel, data) {
-    const maxBufferAmount = CONFIG.bufferThreshold;
-    const checkInterval = CONFIG.bufferCheckInterval;
-    
-    return new Promise((resolve, reject) => {
-        const send = () => {
-            try {
-                // Check if buffer is too full
-                if (dataChannel.bufferedAmount > maxBufferAmount) {
-                    // Wait and check again
-                    setTimeout(send, checkInterval);
-                    return;
-                }
-                
-                // Check if channel is still open
-                if (dataChannel.readyState !== 'open') {
-                    reject(new Error('DataChannel is not open'));
-                    return;
-                }
-                
-                // Send the data
-                dataChannel.send(data);
-                
-                // For large binary data, wait a bit for buffer to clear
-                if (data instanceof ArrayBuffer && data.byteLength > 1024) {
-                    setTimeout(resolve, 10);
-                } else {
-                    resolve();
-                }
-            } catch (error) {
-                reject(error);
-            }
-        };
-        
-        send();
-    });
+    if (dataChannel.readyState !== 'open') {
+        throw new Error('DataChannel is not open');
+    }
+
+    while (dataChannel.bufferedAmount > CONFIG.bufferThreshold) {
+        await new Promise(resolve => {
+            dataChannel.bufferedAmountLowThreshold = CONFIG.bufferThreshold;
+            dataChannel.onbufferedamountlow = () => {
+                dataChannel.onbufferedamountlow = null;
+                resolve();
+            };
+        });
+
+        if (dataChannel.readyState !== 'open') {
+            throw new Error('DataChannel is not open');
+        }
+    }
+
+    dataChannel.send(data);
 }
 
 // Handle incoming data channel messages
@@ -722,29 +869,20 @@ function handleDataChannelMessage(event, peerId) {
     // Handle JSON messages
     try {
         const message = JSON.parse(event.data);
-        
+
         switch (message.type) {
             case 'file-start':
                 handleFileStart(message, peerId);
                 break;
-                
-            case 'file-chunk-meta':
-                handleFileChunkMeta(message, peerId);
-                break;
-                
-            case 'file-chunk':
-                // Legacy format (for backwards compatibility)
-                handleFileChunk(message, peerId);
-                break;
-                
+
             case 'file-end':
                 handleFileEnd(message, peerId);
                 break;
-                
+
             case 'transfer-cancel':
                 handleTransferCancel(message, peerId);
                 break;
-                
+
             case 'transfer-resume':
                 handleTransferResume(message, peerId);
                 break;
@@ -754,22 +892,41 @@ function handleDataChannelMessage(event, peerId) {
     }
 }
 
-// Handle binary data (actual file chunks)
+// Handle binary data (actual file chunks - no per-chunk metadata needed)
 function handleBinaryData(data, peerId) {
-    // Find the active transfer waiting for binary data
+    // Find the active receiving transfer for this peer
     for (const [transferId, transfer] of state.activeTransfers) {
-        if (transfer.peerId === peerId && 
-            transfer.direction === 'receive' && 
-            transfer.expectingBinary) {
-            
+        if (transfer.peerId === peerId &&
+            transfer.direction === 'receive' &&
+            transfer.status === 'receiving') {
+
             // Store the binary chunk
             const chunkData = new Uint8Array(data);
-            transfer.chunks.push(chunkData);
-            transfer.bytesReceived += chunkData.byteLength;
-            transfer.progress = (transfer.bytesReceived / transfer.fileSize) * 100;
-            transfer.expectingBinary = false;
-            
-            updateTransferUI(transfer);
+
+            // If streaming to disk, serialize writes via a promise chain
+            if (transfer.writableStream) {
+                const writePromise = (transfer.writeChain || Promise.resolve())
+                    .then(() => transfer.writableStream.write(chunkData))
+                    .then(() => {
+                        transfer.bytesReceived += chunkData.byteLength;
+                        transfer.progress = (transfer.bytesReceived / transfer.fileSize) * 100;
+                        transfer.lastActivity = Date.now();
+                        updateTransferUI(transfer);
+                    })
+                    .catch(err => {
+                        console.error('Error writing to stream:', err);
+                        transfer.status = 'failed';
+                        updateTransferUI(transfer);
+                    });
+                transfer.writeChain = writePromise;
+            } else {
+                // Accumulate in memory (fallback)
+                transfer.chunks.push(chunkData);
+                transfer.bytesReceived += chunkData.byteLength;
+                transfer.progress = (transfer.bytesReceived / transfer.fileSize) * 100;
+                transfer.lastActivity = Date.now();
+                updateTransferUI(transfer);
+            }
             break;
         }
     }
@@ -788,72 +945,118 @@ function handleFileStart(message, peerId) {
         bytesReceived: 0,
         status: 'receiving',
         startTime: Date.now(),
+        lastActivity: Date.now(),
         chunks: [],
-        expectingBinary: false
+        writableStream: null,
+        writeChain: null
     };
-    
+
+    // Register transfer FIRST so incoming binary chunks are not lost
     state.activeTransfers.set(message.transferId, transfer);
     addTransferToUI(transfer);
-    
+
     showToast(`Receiving ${message.name} from ${state.peers.get(peerId)?.name || 'device'}`, 'info');
+
+    // For large files, try to set up streaming to disk asynchronously
+    // Chunks will accumulate in transfer.chunks until the stream is ready,
+    // then we flush them and switch to streaming mode
+    if (message.size > 100 * 1024 * 1024 && typeof window.showSaveFilePicker === 'function') {
+        setupStreamingReceive(transfer, message);
+    } else if (message.size > 500 * 1024 * 1024) {
+        showToast(`Warning: ${message.name} is very large (${formatFileSize(message.size)}). May use significant memory.`, 'warning');
+    }
 }
 
-// Handle file chunk metadata
-function handleFileChunkMeta(message, peerId) {
-    const transfer = state.activeTransfers.get(message.transferId);
-    
-    if (!transfer) {
-        console.error('Transfer not found:', message.transferId);
-        return;
-    }
-    
-    // Mark that we're expecting binary data next
-    transfer.expectingBinary = true;
-}
+// Set up streaming receive asynchronously (chunks accumulate in memory until ready)
+async function setupStreamingReceive(transfer, message) {
+    try {
+        const fileHandle = await window.showSaveFilePicker({
+            suggestedName: message.name,
+            types: [{
+                description: 'File',
+                accept: { [message.mimeType || 'application/octet-stream']: [] }
+            }]
+        });
+        const writable = await fileHandle.createWritable();
 
-// Handle incoming file chunk (legacy JSON format)
-function handleFileChunk(message, peerId) {
-    const transfer = state.activeTransfers.get(message.transferId);
-    
-    if (!transfer) {
-        console.error('Transfer not found:', message.transferId);
-        return;
+        // Switch to streaming mode FIRST, so new chunks go through writeChain
+        // instead of appending to transfer.chunks
+        transfer.writableStream = writable;
+
+        // Snapshot the accumulated chunks and clear the array atomically
+        const pendingChunks = transfer.chunks;
+        transfer.chunks = [];
+
+        // Flush pending chunks through the write chain so they serialize
+        // with any new chunks arriving via handleBinaryData
+        let flushChain = Promise.resolve();
+        for (const chunk of pendingChunks) {
+            flushChain = flushChain.then(() => writable.write(chunk));
+        }
+        transfer.writeChain = flushChain;
+
+        console.log(`Streaming large file ${message.name} directly to disk (flushed ${pendingChunks.length} buffered chunks)`);
+    } catch (err) {
+        // User cancelled or API not supported - stay in memory mode
+        console.log('File System Access API unavailable or cancelled, using in-memory fallback');
+        if (message.size > 500 * 1024 * 1024) {
+            showToast(`Warning: ${message.name} is very large (${formatFileSize(message.size)}). May use significant memory.`, 'warning');
+        }
     }
-    
-    // Convert array back to Uint8Array
-    const chunkData = new Uint8Array(message.data);
-    transfer.chunks.push(chunkData);
-    transfer.bytesReceived += chunkData.length;
-    transfer.progress = (transfer.bytesReceived / transfer.fileSize) * 100;
-    
-    updateTransferUI(transfer);
 }
 
 // Handle file end
-function handleFileEnd(message, peerId) {
+async function handleFileEnd(message, peerId) {
     const transfer = state.activeTransfers.get(message.transferId);
-    
+
     if (!transfer) {
         console.error('Transfer not found:', message.transferId);
         return;
     }
-    
-    // Combine all chunks
-    const blob = new Blob(transfer.chunks, { type: transfer.mimeType });
-    
-    // Create download link
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = transfer.fileName;
-    a.click();
-    
-    // Cleanup
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    
+
+    if (transfer.writableStream) {
+        // Wait for all pending writes to finish before closing
+        try {
+            if (transfer.writeChain) {
+                await transfer.writeChain;
+            }
+            await transfer.writableStream.close();
+        } catch (err) {
+            console.error('Error closing writable stream:', err);
+            transfer.status = 'failed';
+            updateTransferUI(transfer);
+            showToast(`Failed to save ${transfer.fileName}`, 'error');
+            return;
+        }
+        transfer.writableStream = null;
+        transfer.writeChain = null;
+    } else {
+        // In-memory mode: combine chunks and trigger download
+        const blob = new Blob(transfer.chunks, { type: transfer.mimeType });
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = transfer.fileName;
+        a.click();
+
+        // Cleanup
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        transfer.chunks = []; // Free memory
+    }
+
+    // Integrity check: verify total bytes if sender included it
+    if (message.totalBytes && transfer.bytesReceived !== message.totalBytes) {
+        console.error(`Size mismatch: received ${transfer.bytesReceived}, expected ${message.totalBytes}`);
+        transfer.status = 'failed';
+        updateTransferUI(transfer);
+        showToast(`Transfer corrupted: ${transfer.fileName} (size mismatch)`, 'error');
+        return;
+    }
+
     transfer.status = 'completed';
     updateTransferUI(transfer);
-    
+
     showToast(`Received ${transfer.fileName}`, 'success');
 }
 
@@ -939,14 +1142,15 @@ function handleTransferResume(message, peerId) {
 // Handle peer disconnect
 function handlePeerDisconnect(peerId) {
     state.peers.delete(peerId);
-    
+    state.peerLocality.delete(peerId);
+
     // Close connection
     const connection = state.connections.get(peerId);
     if (connection) {
         connection.close();
         state.connections.delete(peerId);
     }
-    
+
     // Remove data channel
     state.dataChannels.delete(peerId);
     
@@ -1015,6 +1219,23 @@ function updateDevicesList() {
             deviceCard.classList.add('active');
         }
         
+        const locality = state.peerLocality.get(peerId);
+        let localityIndicator = '';
+        if (isConnected && locality === 'verified') {
+            localityIndicator = '<span class="locality-badge verified" title="Verified local connection">&#x1f512;</span>';
+        } else if (isConnected && locality === 'confirmed') {
+            localityIndicator = '<span class="locality-badge confirmed" title="User confirmed local">&#x26a0;</span>';
+        } else if (isConnected && locality === 'blocked') {
+            localityIndicator = '<span class="locality-badge blocked" title="Relay detected - blocked">&#x1f6ab;</span>';
+        }
+
+        let statusText = 'Click to connect';
+        if (isConnected && locality === 'blocked') {
+            statusText = 'Blocked (not local)';
+        } else if (isConnected) {
+            statusText = 'Click to send files';
+        }
+
         deviceCard.innerHTML = `
             <div class="device-icon">
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1022,8 +1243,8 @@ function updateDevicesList() {
                     <line x1="12" y1="18" x2="12" y2="18"></line>
                 </svg>
             </div>
-            <div class="device-name">${peer.name}</div>
-            <div class="device-status">${isConnected ? 'Click to send files' : 'Click to connect'}</div>
+            <div class="device-name">${peer.name} ${localityIndicator}</div>
+            <div class="device-status">${statusText}</div>
         `;
         
         deviceCard.addEventListener('click', () => {
