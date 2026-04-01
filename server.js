@@ -12,6 +12,22 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// ── Maintenance mode ─────────────────────────────
+// Set to true to show maintenance page for all visitors.
+// WebSocket connections and /api/version still work so you can verify the deploy.
+const MAINTENANCE_MODE = true;
+
+app.use((req, res, next) => {
+  if (MAINTENANCE_MODE
+      && req.path !== '/maintenance.html'
+      && !req.path.startsWith('/api/')
+      && req.path !== '/live') {
+    return res.sendFile(path.join(__dirname, 'public', 'maintenance.html'));
+  }
+  next();
+});
+// ─────────────────────────────────────────────────
+
 // Serve static files
 app.use(express.static('public'));
 
