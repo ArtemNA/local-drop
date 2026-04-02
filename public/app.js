@@ -4,7 +4,7 @@ const CONFIG = {
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' }
     ],
-    chunkSize: 1 * 1024 * 1024, // 1MB chunks for better throughput
+    chunkSize: 64 * 1024, // 64KB default — safe fallback, overridden per-connection via SCTP maxMessageSize
     bufferThreshold: 2 * 1024 * 1024, // 2MB buffer threshold (under browser ~16MB limit)
     reconnectDelay: 3000,
     reconnectMaxAttempts: 5,
@@ -594,15 +594,23 @@ async function verifyLocality(connection, peerId) {
         }
 
         // Check for verified local: both host candidates with private IPs
-        if (localCandidateType === 'host' && remoteCandidateType === 'host' &&
-            isPrivateIP(localIP) && isPrivateIP(remoteIP)) {
-            state.peerLocality.set(peerId, 'verified');
-            updateDevicesList();
-            return;
+        if (localCandidateType === 'host' && remoteCandidateType === 'host') {
+            // If IPs are available and private, verified
+            if (localIP && remoteIP && isPrivateIP(localIP) && isPrivateIP(remoteIP)) {
+                state.peerLocality.set(peerId, 'verified');
+                updateDevicesList();
+                return;
+            }
+            // If IPs are empty/unavailable (browser privacy), host+host with no relay = direct local
+            if (!localIP && !remoteIP) {
+                state.peerLocality.set(peerId, 'verified');
+                updateDevicesList();
+                return;
+            }
         }
 
         // Additional check: same subnet via localIP hints
-        if (state.localIP && isPrivateIP(localIP) && isPrivateIP(remoteIP)) {
+        if (state.localIP && localIP && remoteIP && isPrivateIP(localIP) && isPrivateIP(remoteIP)) {
             const localSubnet = getSubnet24(localIP);
             const remoteSubnet = getSubnet24(remoteIP);
             if (localSubnet && remoteSubnet && localSubnet === remoteSubnet) {
@@ -749,6 +757,10 @@ async function startFileSend(transfer) {
     transfer.startTime = Date.now();
     updateTransferUI(transfer);
     
+    // Compute effective chunk size for this connection
+    const effectiveChunkSize = getEffectiveChunkSize(transfer.peerId);
+    console.log(`Using chunk size ${effectiveChunkSize} for transfer ${transfer.id}`);
+
     // Send file metadata as JSON (includes chunkSize so receiver knows boundaries)
     const metadata = {
         type: 'file-start',
@@ -757,7 +769,7 @@ async function startFileSend(transfer) {
         size: transfer.file.size,
         mimeType: transfer.file.type,
         lastModified: transfer.file.lastModified,
-        chunkSize: CONFIG.chunkSize
+        chunkSize: effectiveChunkSize
     };
 
     await sendWithFlowControl(dataChannel, JSON.stringify(metadata));
@@ -765,78 +777,105 @@ async function startFileSend(transfer) {
     // Track inactivity for timeout
     transfer.lastActivity = Date.now();
 
-    // Read and send file in chunks (no per-chunk JSON metadata)
-    const reader = new FileReader();
-    let offset = transfer.bytesTransferred;
+    // Wrap the entire send loop in a Promise so processTransferQueue
+    // truly awaits each file before starting the next one
+    await new Promise((resolveTransfer, rejectTransfer) => {
+        const reader = new FileReader();
+        let offset = transfer.bytesTransferred;
 
-    const readNextChunk = async () => {
-        if (offset >= transfer.file.size) {
-            // File transfer complete
-            await sendWithFlowControl(dataChannel, JSON.stringify({
-                type: 'file-end',
-                transferId: transfer.id,
-                totalBytes: offset
-            }));
+        const readNextChunk = async () => {
+            if (offset >= transfer.file.size) {
+                // File transfer complete
+                try {
+                    await sendWithFlowControl(dataChannel, JSON.stringify({
+                        type: 'file-end',
+                        transferId: transfer.id,
+                        totalBytes: offset
+                    }));
+                    transfer.status = 'completed';
+                    updateTransferUI(transfer);
+                    showToast(`Sent ${transfer.file.name}`, 'success');
+                    resolveTransfer();
+                } catch (error) {
+                    transfer.status = 'failed';
+                    updateTransferUI(transfer);
+                    showToast(`Failed to send ${transfer.file.name}`, 'error');
+                    resolveTransfer();
+                }
+                return;
+            }
 
-            transfer.status = 'completed';
-            updateTransferUI(transfer);
-            showToast(`Sent ${transfer.file.name}`, 'success');
-            return;
-        }
+            if (transfer.status === 'paused' || transfer.status === 'cancelled') {
+                resolveTransfer();
+                return;
+            }
 
-        if (transfer.status === 'paused' || transfer.status === 'cancelled') {
-            return;
-        }
+            // Inactivity timeout check
+            if (Date.now() - transfer.lastActivity > CONFIG.inactivityTimeout) {
+                transfer.status = 'failed';
+                updateTransferUI(transfer);
+                showToast(`Transfer timed out: ${transfer.file.name}`, 'error');
+                resolveTransfer();
+                return;
+            }
 
-        // Inactivity timeout check
-        if (Date.now() - transfer.lastActivity > CONFIG.inactivityTimeout) {
-            transfer.status = 'failed';
-            updateTransferUI(transfer);
-            showToast(`Transfer timed out: ${transfer.file.name}`, 'error');
-            return;
-        }
+            const chunk = transfer.file.slice(offset, offset + effectiveChunkSize);
+            reader.readAsArrayBuffer(chunk);
+        };
 
-        const chunk = transfer.file.slice(offset, offset + CONFIG.chunkSize);
-        reader.readAsArrayBuffer(chunk);
-    };
+        reader.onload = async (event) => {
+            if (dataChannel.readyState !== 'open') {
+                transfer.status = 'paused';
+                updateTransferUI(transfer);
+                resolveTransfer();
+                return;
+            }
 
-    reader.onload = async (event) => {
-        if (dataChannel.readyState !== 'open') {
-            transfer.status = 'paused';
-            updateTransferUI(transfer);
-            return;
-        }
+            try {
+                // Send only binary data (no per-chunk JSON metadata)
+                await sendWithFlowControl(dataChannel, event.target.result);
 
-        try {
-            // Send only binary data (no per-chunk JSON metadata)
-            await sendWithFlowControl(dataChannel, event.target.result);
+                offset += event.target.result.byteLength;
+                transfer.bytesTransferred = offset;
+                transfer.progress = (offset / transfer.file.size) * 100;
+                transfer.lastActivity = Date.now();
+                updateTransferUI(transfer);
 
-            offset += event.target.result.byteLength;
-            transfer.bytesTransferred = offset;
-            transfer.progress = (offset / transfer.file.size) * 100;
-            transfer.lastActivity = Date.now();
-            updateTransferUI(transfer);
+                // Continue reading immediately
+                queueMicrotask(readNextChunk);
+            } catch (error) {
+                console.error('Error sending chunk:', error);
+                transfer.status = 'failed';
+                updateTransferUI(transfer);
+                showToast(`Failed to send ${transfer.file.name}`, 'error');
+                resolveTransfer();
+            }
+        };
 
-            // Continue reading immediately
-            queueMicrotask(readNextChunk);
-        } catch (error) {
-            console.error('Error sending chunk:', error);
+        reader.onerror = () => {
             transfer.status = 'failed';
             updateTransferUI(transfer);
             showToast(`Failed to send ${transfer.file.name}`, 'error');
-        }
-    };
+            resolveTransfer();
+        };
 
-    reader.onerror = () => {
-        transfer.status = 'failed';
-        updateTransferUI(transfer);
-        showToast(`Failed to send ${transfer.file.name}`, 'error');
-    };
-
-    readNextChunk();
+        readNextChunk();
+    });
 }
 
 // Send data with flow control to prevent buffer overflow
+// Get effective chunk size for a connection, respecting SCTP maxMessageSize
+function getEffectiveChunkSize(peerId) {
+    const connection = state.connections.get(peerId);
+    if (connection && connection.sctp && connection.sctp.maxMessageSize) {
+        const maxMsg = connection.sctp.maxMessageSize;
+        const safeMax = maxMsg - 16384; // safety margin for SCTP overhead
+        if (safeMax <= 0) return 16 * 1024; // very small limit, use conservative 16KB
+        return Math.min(safeMax, 256 * 1024); // cap at 256KB, never exceed safeMax
+    }
+    return CONFIG.chunkSize; // fallback to default 64KB
+}
+
 async function sendWithFlowControl(dataChannel, data) {
     if (dataChannel.readyState !== 'open') {
         throw new Error('DataChannel is not open');

@@ -15,7 +15,7 @@ const wss = new WebSocketServer({ server });
 // ── Maintenance mode ─────────────────────────────
 // Set to true to show maintenance page for all visitors.
 // WebSocket connections and /api/version still work so you can verify the deploy.
-const MAINTENANCE_MODE = true;
+const MAINTENANCE_MODE = false;
 
 app.use((req, res, next) => {
   if (MAINTENANCE_MODE
