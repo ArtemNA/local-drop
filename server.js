@@ -102,8 +102,113 @@ const PUBLIC_DEPLOY = process.env.PUBLIC_DEPLOY === 'true';
 // Message size limit for signaling (100KB should be enough for SDP/ICE)
 const MAX_SIGNAL_SIZE = 100 * 1024; // 100KB
 
+// Shared-text ("shared clipboard") sync. Text is gzip-compressed and base64'd on
+// the client, then split into chunks so arbitrarily large payloads can travel over
+// the signaling channel. This is exempt from the file-transfer heuristics below —
+// it's legitimate collaborative text, not a covert binary tunnel — but still capped.
+const MAX_TEXT_CHUNK = 512 * 1024;        // max size of a single chunk WS frame
+const MAX_TEXT_TOTAL = 60 * 1024 * 1024;  // max assembled (compressed+base64) snapshot ≈ maps to ~100MB+ of raw text
+const SNAP_CHUNK = 128 * 1024;            // chunk size when streaming a snapshot to a late joiner
+
+const sharedTexts = new Map();  // channelKey -> { enc, language, data (base64), updatedAt }
+const pendingTexts = new Map(); // channelKey -> in-progress reassembly { rev, count, parts, received, bytes, enc, language }
+let snapRevCounter = 0;
+
 // Track message sizes per client to detect file transfer attempts
 const clientMessageStats = new Map();
+
+// The "channel" a client's shared text belongs to: their room in public mode,
+// or a single global channel in local mode (everyone on the LAN shares one).
+function getChannelKey(clientInfo) {
+  if (clientInfo.roomCode) return 'ROOM:' + clientInfo.roomCode;
+  if (!PUBLIC_DEPLOY) return 'LOCAL';
+  return null; // public mode but not in a room yet — nothing to sync
+}
+
+// Send a payload to every other client on the same channel as clientInfo.
+function broadcastChannel(clientInfo, payload) {
+  if (clientInfo.roomCode) {
+    getClientsInRoom(clientInfo.roomCode).forEach(c => {
+      if (c.id !== clientInfo.id && c.ws.readyState === 1) c.ws.send(payload);
+    });
+  } else if (!PUBLIC_DEPLOY) {
+    clients.forEach((c, id) => {
+      if (id !== clientInfo.id && c.ws.readyState === 1) c.ws.send(payload);
+    });
+  }
+}
+
+// Handle one incoming shared-text chunk: relay it live to peers, and assemble the
+// full snapshot server-side so devices that join later can catch up.
+function handleTextShare(clientInfo, message) {
+  const key = getChannelKey(clientInfo);
+  if (!key) return;
+
+  const { rev, seq, count, enc, language, data } = message;
+  if (typeof rev !== 'string' || typeof seq !== 'number' ||
+      typeof count !== 'number' || typeof data !== 'string') return;
+  if (!Number.isInteger(count) || count < 1 || count > 1000000) return;
+  if (!Number.isInteger(seq) || seq < 0 || seq >= count) return;
+
+  const lang = typeof language === 'string' ? language.slice(0, 30) : 'auto';
+
+  // 1) Relay this chunk live to everyone else on the channel (pass-through).
+  broadcastChannel(clientInfo, JSON.stringify({
+    type: 'text-update',
+    rev, seq, count, enc, language: lang, data,
+    fromId: clientInfo.id,
+    fromName: clientInfo.name
+  }));
+
+  // 2) Reassemble server-side for late joiners.
+  let pend = pendingTexts.get(key);
+  if (!pend || pend.rev !== rev) {
+    pend = { rev, count, parts: new Array(count), received: 0, bytes: 0, enc, language: lang, updatedAt: Date.now() };
+    pendingTexts.set(key, pend);
+  }
+  pend.updatedAt = Date.now();
+  if (pend.parts[seq] === undefined) {
+    pend.parts[seq] = data;
+    pend.received++;
+    pend.bytes += data.length;
+    if (pend.bytes > MAX_TEXT_TOTAL) {
+      pendingTexts.delete(key); // too big — drop the snapshot (live relay already happened)
+      return;
+    }
+  }
+  if (pend.received >= pend.count) {
+    sharedTexts.set(key, {
+      enc: pend.enc,
+      language: pend.language,
+      data: pend.parts.join(''),
+      updatedAt: Date.now()
+    });
+    pendingTexts.delete(key);
+  }
+}
+
+// Stream the current channel snapshot to a single (usually just-joined) client,
+// chunked the same way live edits are, so the client reuses one reassembly path.
+function streamSnapshotTo(clientInfo, key) {
+  const snap = sharedTexts.get(key);
+  if (!snap || !snap.data) return;
+
+  const data = snap.data;
+  const count = Math.max(1, Math.ceil(data.length / SNAP_CHUNK));
+  const rev = 'snap-' + (snapRevCounter++);
+
+  for (let seq = 0; seq < count; seq++) {
+    if (clientInfo.ws.readyState !== 1) break;
+    clientInfo.ws.send(JSON.stringify({
+      type: 'text-update',
+      rev, seq, count,
+      enc: snap.enc,
+      language: snap.language,
+      data: data.slice(seq * SNAP_CHUNK, (seq + 1) * SNAP_CHUNK)
+      // no fromName — a snapshot shouldn't show as "Updated by <peer>"
+    }));
+  }
+}
 
 wss.on('connection', (ws, req) => {
   const clientId = uuidv4();
@@ -159,7 +264,10 @@ wss.on('connection', (ws, req) => {
           name: info.name
         }))
     }));
-    
+
+    // Catch the new device up on the current shared text (if any)
+    streamSnapshotTo(clientInfo, 'LOCAL');
+
     // Notify other clients about new peer
     broadcast(clientId, {
       type: 'peer-joined',
@@ -200,7 +308,9 @@ wss.on('connection', (ws, req) => {
         deviceName: clientInfo.name,
         peers: peersInRoom
       }));
-      
+
+      streamSnapshotTo(clientInfo, 'ROOM:' + normalizedRoomCode);
+
       // Notify other room members
       broadcastToRoom(normalizedRoomCode, clientId, {
         type: 'peer-joined',
@@ -253,7 +363,9 @@ wss.on('connection', (ws, req) => {
       autoRoom: true,
       peers: peersInRoom
     }));
-    
+
+    streamSnapshotTo(clientInfo, 'ROOM:' + roomCode);
+
     // Notify other room members
     broadcastToRoom(roomCode, clientId, {
       type: 'peer-joined',
@@ -275,6 +387,24 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data) => {
     try {
       const messageSize = data.length;
+
+      // Shared-text sync is handled first and bypasses the file-transfer
+      // heuristics below (it is legitimate small text, not a chunked file).
+      let earlyParsed = null;
+      try { earlyParsed = JSON.parse(data); } catch (_) { /* handled below */ }
+      if (earlyParsed && earlyParsed.type === 'text-share') {
+        if (messageSize > MAX_TEXT_CHUNK + 4096) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Shared-text chunk is too large.',
+            code: 'TEXT_CHUNK_TOO_LARGE'
+          }));
+          return;
+        }
+        handleTextShare(clientInfo, earlyParsed);
+        return;
+      }
+
       const stats = clientMessageStats.get(clientId);
       
       // Update statistics
@@ -453,8 +583,15 @@ wss.on('connection', (ws, req) => {
     
     clients.delete(clientId);
     clientMessageStats.delete(clientId);
+
+    // In local mode everyone shares the 'LOCAL' channel — once the last device
+    // leaves, drop its shared text so nothing lingers in memory.
+    if (!PUBLIC_DEPLOY && clients.size === 0) {
+      sharedTexts.delete('LOCAL');
+      pendingTexts.delete('LOCAL');
+    }
   });
-  
+
   ws.on('error', (error) => {
     console.error(`[Error] WebSocket error for ${clientId}:`, error.message);
   });
@@ -524,7 +661,9 @@ function handleJoinRoom(clientInfo, roomCode) {
     roomCode: normalizedCode,
     peers: peersInRoom
   }));
-  
+
+  streamSnapshotTo(clientInfo, 'ROOM:' + normalizedCode);
+
   // Notify other room members
   broadcastToRoom(normalizedCode, clientInfo.id, {
     type: 'peer-joined',
@@ -544,6 +683,8 @@ function leaveRoom(clientId, roomCode) {
     // Delete room if empty
     if (room.size === 0) {
       rooms.delete(roomCode);
+      sharedTexts.delete('ROOM:' + roomCode);
+      pendingTexts.delete('ROOM:' + roomCode);
       console.log(`[Room] Room ${roomCode} deleted (empty)`);
     } else {
       // Notify remaining room members
@@ -582,6 +723,8 @@ app.get('/api/info', (req, res) => {
   res.json({
     totalClients: clients.size,
     totalRooms: rooms.size,
+    sharedTextChannels: sharedTexts.size,
+    pendingTextChannels: pendingTexts.size,
     isPublicDeployment: PUBLIC_DEPLOY,
     autoRoomEnabled: AUTO_ROOM_MODE
   });
@@ -612,6 +755,37 @@ function keepAlive() {
 
 // Run the keep-alive function every 14 minutes
 setInterval(keepAlive, 4 * 60 * 1000);
+
+// ── Shared-text garbage collection ───────────────
+// Belt-and-suspenders so shared-text buffers can never accumulate: even though
+// channels are cleared on room-empty / last-local-device-leaves, this sweep
+// also drops interrupted reassembly buffers and any orphaned snapshot.
+const PENDING_STALE_MS = 2 * 60 * 1000; // interrupted transfer buffer lifetime
+
+function channelHasClients(key) {
+  if (key === 'LOCAL') return clients.size > 0;
+  if (key.startsWith('ROOM:')) {
+    const room = rooms.get(key.slice(5));
+    return !!room && room.size > 0;
+  }
+  return false;
+}
+
+function sweepSharedTexts() {
+  const now = Date.now();
+  for (const [key, pend] of pendingTexts) {
+    if (now - (pend.updatedAt || 0) > PENDING_STALE_MS || !channelHasClients(key)) {
+      pendingTexts.delete(key);
+    }
+  }
+  for (const [key] of sharedTexts) {
+    if (!channelHasClients(key)) {
+      sharedTexts.delete(key);
+    }
+  }
+}
+
+setInterval(sweepSharedTexts, 60 * 1000);
 
 // Start server
 const PORT = process.env.PORT || 3000;

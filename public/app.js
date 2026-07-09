@@ -19,6 +19,8 @@ const state = {
     deviceName: 'Device',
     roomCode: null,
     inRoom: false,
+    localMode: false,
+    sharedText: { timer: null, revCounter: 0, lastSentSig: null, incoming: null, sending: false },
     peers: new Map(),
     connections: new Map(),
     dataChannels: new Map(),
@@ -81,6 +83,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.log('Detected local IP:', state.localIP);
     
     loadDeviceName();
+    initSharedText();
     initializeWebSocket();
     setupEventListeners();
     setupDragAndDrop();
@@ -199,6 +202,7 @@ function handleWebSocketMessage(event) {
             if (message.localMode) {
                 // Local mode - no rooms needed
                 state.inRoom = false;
+                state.localMode = true;
                 message.peers.forEach(peer => {
                     state.peers.set(peer.id, peer);
                 });
@@ -246,7 +250,7 @@ function handleWebSocketMessage(event) {
             hideRoomSection();
             showRoomInfo(message.roomCode);
             updateDevicesList();
-            
+
             // Update URL with room code
             const url = new URL(window.location);
             url.searchParams.set('room', message.roomCode);
@@ -300,6 +304,10 @@ function handleWebSocketMessage(event) {
             }
             break;
             
+        case 'text-update':
+            handleTextUpdateChunk(message);
+            break;
+
         case 'server-shutdown':
             showToast('Server is shutting down', 'warning');
             break;
@@ -1764,6 +1772,343 @@ function setupEventListeners() {
             document.getElementById('dropZone').classList.add('hidden');
         }
     });
+}
+
+// ─────────────────────────────────────────────
+// Shared Text (live shared clipboard, synced via the server relay so it works
+// over the internet, not just the LAN). Formatting is preserved byte-for-byte;
+// syntax highlighting is cosmetic and degrades gracefully if hljs isn't loaded.
+// ─────────────────────────────────────────────
+const ts = {}; // cached DOM refs, populated in initSharedText()
+
+function initSharedText() {
+    ts.fab = document.getElementById('sharedTextFab');
+    ts.modal = document.getElementById('textShareModal');
+    ts.editor = document.getElementById('tsEditor');
+    ts.textarea = document.getElementById('tsTextarea');
+    ts.pre = document.querySelector('.ts-highlight');
+    ts.code = document.getElementById('tsHighlight');
+    ts.language = document.getElementById('tsLanguage');
+    ts.status = document.getElementById('tsStatus');
+    ts.copyBtn = document.getElementById('tsCopyBtn');
+    ts.clearBtn = document.getElementById('tsClearBtn');
+    ts.closeBtn = document.getElementById('tsCloseBtn');
+
+    if (!ts.fab || !ts.modal || !ts.textarea) return;
+
+    ts.fab.addEventListener('click', openSharedText);
+    ts.closeBtn.addEventListener('click', closeSharedText);
+    ts.modal.addEventListener('click', (e) => {
+        if (e.target === ts.modal) closeSharedText();
+    });
+
+    // Typing → re-highlight + debounced broadcast
+    ts.textarea.addEventListener('input', () => {
+        renderSharedHighlight();
+        syncSharedScroll();
+        sendSharedText(false);
+    });
+    ts.textarea.addEventListener('scroll', syncSharedScroll);
+
+    // Insert a real tab instead of moving focus (handy for code)
+    ts.textarea.addEventListener('keydown', (e) => {
+        if (e.key === 'Tab') {
+            e.preventDefault();
+            const s = ts.textarea.selectionStart, en = ts.textarea.selectionEnd;
+            const v = ts.textarea.value;
+            ts.textarea.value = v.slice(0, s) + '    ' + v.slice(en);
+            ts.textarea.selectionStart = ts.textarea.selectionEnd = s + 4;
+            renderSharedHighlight();
+            sendSharedText(false);
+        }
+    });
+
+    // Language choice is part of the shared state — propagate it to peers
+    ts.language.addEventListener('change', () => {
+        renderSharedHighlight();
+        sendSharedText(true);
+    });
+
+    ts.copyBtn.addEventListener('click', copySharedText);
+    ts.clearBtn.addEventListener('click', clearSharedText);
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !ts.modal.classList.contains('hidden')) {
+            closeSharedText();
+        }
+    });
+}
+
+function openSharedText() {
+    ts.modal.classList.remove('hidden');
+    ts.fab.classList.remove('has-activity');
+    renderSharedHighlight();
+    updateSharedStatus();
+    setTimeout(() => ts.textarea.focus(), 50);
+}
+
+function closeSharedText() {
+    ts.modal.classList.add('hidden');
+}
+
+function isSharedChannelReady() {
+    return state.localMode || state.inRoom;
+}
+
+function updateSharedStatus() {
+    if (!isSharedChannelReady()) {
+        setSharedStatus('Join a room to sync live', '');
+    } else if (!ts.status.textContent || ts.status.textContent === 'Idle') {
+        setSharedStatus('Live', 'synced');
+    }
+}
+
+function setSharedStatus(text, cls) {
+    if (!ts.status) return;
+    ts.status.textContent = text;
+    ts.status.className = 'ts-status' + (cls ? ' ' + cls : '');
+}
+
+function escapeHtml(str) {
+    return str.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+// Above this many characters we stop syntax-highlighting (highlighting megabytes
+// would freeze the tab) and drop to "plain mode": the textarea text is made
+// visible directly and the highlight overlay is hidden. Sync still works fully.
+const TS_HIGHLIGHT_MAX = 100 * 1024;
+const TS_CHUNK_SIZE = 128 * 1024;         // base64 chars per outgoing chunk
+const TS_MAX_CHARS = 80 * 1024 * 1024;    // hard client cap on raw text length
+
+function renderSharedHighlight() {
+    if (!ts.textarea || !ts.code) return;
+    const text = ts.textarea.value;
+
+    // Plain mode for very large text — keep the editor responsive.
+    if (text.length > TS_HIGHLIGHT_MAX) {
+        ts.editor.classList.add('plain');
+        ts.code.innerHTML = '';
+        return;
+    }
+    ts.editor.classList.remove('plain');
+
+    const lang = ts.language.value;
+    let html;
+    if (typeof hljs !== 'undefined' && lang !== 'plaintext') {
+        try {
+            html = (lang === 'auto')
+                ? hljs.highlightAuto(text).value
+                : hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
+        } catch (_) {
+            html = escapeHtml(text);
+        }
+    } else {
+        html = escapeHtml(text);
+    }
+    // Trailing newline keeps the last line visible and scroll heights aligned
+    ts.code.innerHTML = html + '\n';
+}
+
+function syncSharedScroll() {
+    if (ts.pre && ts.textarea) {
+        ts.pre.scrollTop = ts.textarea.scrollTop;
+        ts.pre.scrollLeft = ts.textarea.scrollLeft;
+    }
+}
+
+// ── Compression + base64 helpers (support arbitrarily large payloads) ──
+function bytesToBase64(bytes) {
+    let bin = '';
+    const CH = 0x8000; // avoid arg-count limits on fromCharCode
+    for (let i = 0; i < bytes.length; i += CH) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    }
+    return btoa(bin);
+}
+
+function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+}
+
+async function encodeSharedText(text) {
+    const raw = new TextEncoder().encode(text);
+    if (typeof CompressionStream !== 'undefined') {
+        try {
+            const stream = new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'));
+            const buf = await new Response(stream).arrayBuffer();
+            return { enc: 'gzip', b64: bytesToBase64(new Uint8Array(buf)) };
+        } catch (_) { /* fall through to raw */ }
+    }
+    return { enc: 'raw', b64: bytesToBase64(raw) };
+}
+
+async function decodeSharedText(b64, enc) {
+    const bytes = base64ToBytes(b64);
+    if (enc === 'gzip' && typeof DecompressionStream !== 'undefined') {
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return await new Response(stream).text();
+    }
+    return new TextDecoder().decode(bytes);
+}
+
+// Compress the current text, split into chunks, and stream them to the channel.
+function sendSharedText(immediate) {
+    if (state.sharedText.timer) {
+        clearTimeout(state.sharedText.timer);
+        state.sharedText.timer = null;
+    }
+
+    const doSend = async () => {
+        state.sharedText.timer = null;
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+
+        const text = ts.textarea.value;
+        const language = ts.language.value;
+        const sig = language + ' ' + text;
+        if (sig === state.sharedText.lastSentSig) return; // nothing changed
+
+        if (text.length > TS_MAX_CHARS) {
+            setSharedStatus('Too large to sync (over 80M chars)', '');
+            showToast('Text is too large to share', 'error');
+            return;
+        }
+
+        try {
+            state.sharedText.sending = true;
+            const { enc, b64 } = await encodeSharedText(text);
+            const rev = (state.clientId || 'me') + '-' + (++state.sharedText.revCounter);
+            const count = Math.max(1, Math.ceil(b64.length / TS_CHUNK_SIZE));
+
+            for (let seq = 0; seq < count; seq++) {
+                if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+                state.ws.send(JSON.stringify({
+                    type: 'text-share',
+                    rev, seq, count, enc, language,
+                    data: b64.slice(seq * TS_CHUNK_SIZE, (seq + 1) * TS_CHUNK_SIZE)
+                }));
+            }
+
+            state.sharedText.lastSentSig = sig;
+            const size = formatFileSize(new Blob([text]).size);
+            setSharedStatus(
+                isSharedChannelReady()
+                    ? `Synced · ${size}${count > 1 ? ' · ' + count + ' chunks' : ''}`
+                    : `Saved locally · ${size}`,
+                'synced'
+            );
+        } catch (e) {
+            console.error('Shared text send failed:', e);
+            setSharedStatus('Sync failed', '');
+        } finally {
+            state.sharedText.sending = false;
+        }
+    };
+
+    if (immediate) {
+        doSend();
+    } else {
+        setSharedStatus('Saving…', 'saving');
+        // Longer debounce for large text so we don't re-compress on every keystroke
+        const delay = ts.textarea.value.length > 500 * 1024 ? 900 : 400;
+        state.sharedText.timer = setTimeout(doSend, delay);
+    }
+}
+
+// Reassemble incoming shared-text chunks (from a live edit or a joined-snapshot
+// stream), then decompress and apply once the full payload has arrived.
+function handleTextUpdateChunk(message) {
+    if (!ts.textarea) return;
+    const { rev, seq, count, enc, language, data, fromName } = message;
+    if (typeof rev !== 'string' || typeof seq !== 'number' ||
+        typeof count !== 'number' || typeof data !== 'string') return;
+
+    const st = state.sharedText;
+    if (!st.incoming || st.incoming.rev !== rev) {
+        st.incoming = { rev, count, enc, language, fromName, parts: new Array(count), received: 0 };
+    }
+    const inc = st.incoming;
+    if (inc.parts[seq] === undefined) {
+        inc.parts[seq] = data;
+        inc.received++;
+    }
+
+    if (inc.count > 1 && inc.received < inc.count) {
+        setSharedStatus(`Receiving… ${inc.received}/${inc.count}`, 'remote');
+        if (ts.modal.classList.contains('hidden')) ts.fab.classList.add('has-activity');
+        return;
+    }
+    if (inc.received < inc.count) return;
+
+    const b64 = inc.parts.join('');
+    st.incoming = null;
+    decodeSharedText(b64, inc.enc).then(text => {
+        applyRemoteText(text, inc.language, inc.fromName);
+    }).catch(err => {
+        console.error('Shared text decode failed:', err);
+    });
+}
+
+// Apply fully-assembled remote text without echoing it back. Programmatic
+// .value assignment does not fire 'input', so no re-send loop occurs.
+function applyRemoteText(text, language, fromName) {
+    if (!ts.textarea || typeof text !== 'string') return;
+
+    if (typeof language === 'string' && language &&
+        [...ts.language.options].some(o => o.value === language)) {
+        ts.language.value = language;
+    }
+
+    if (ts.textarea.value !== text) {
+        const start = ts.textarea.selectionStart;
+        const end = ts.textarea.selectionEnd;
+        ts.textarea.value = text;
+        const len = ts.textarea.value.length;
+        try { ts.textarea.setSelectionRange(Math.min(start, len), Math.min(end, len)); } catch (_) {}
+    }
+
+    // Mark as already-synced so a later local edit diffs against this correctly
+    // and we don't rebroadcast identical content.
+    state.sharedText.lastSentSig = ts.language.value + ' ' + text;
+
+    renderSharedHighlight();
+    syncSharedScroll();
+
+    if (fromName) {
+        setSharedStatus('Updated by ' + fromName, 'remote');
+        if (ts.modal.classList.contains('hidden')) {
+            ts.fab.classList.add('has-activity');
+        }
+    }
+}
+
+function copySharedText() {
+    const text = ts.textarea.value;
+    if (!text) { showToast('Nothing to copy', 'warning'); return; }
+    const done = () => showToast('Copied to clipboard', 'success');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(() => {
+            ts.textarea.select();
+            document.execCommand('copy');
+            done();
+        });
+    } else {
+        ts.textarea.select();
+        document.execCommand('copy');
+        done();
+    }
+}
+
+function clearSharedText() {
+    if (!ts.textarea.value) return;
+    ts.textarea.value = '';
+    renderSharedHighlight();
+    syncSharedScroll();
+    sendSharedText(true); // clears for everyone on the channel
+    showToast(isSharedChannelReady() ? 'Cleared for everyone' : 'Cleared', 'info');
+    ts.textarea.focus();
 }
 
 // Utility functions
