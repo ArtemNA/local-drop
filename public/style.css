@@ -1499,3 +1499,17 @@ body.dragging .device-card:not(.drag-over) {
 [data-theme="dark"] .hljs-tag { color: #94e2d5; }
 [data-theme="dark"] .hljs-deletion { color: #f38ba8; }
 [data-theme="dark"] .hljs-meta { color: #9399b2; }
+
+/* iOS Safari zooms the whole page into any focused field whose text is
+   smaller than 16px (and stays zoomed). On phones/tablets every text field
+   gets 16px; the editor's highlight layer must match its textarea exactly. */
+@media (max-width: 768px), (pointer: coarse) {
+    input[type="text"],
+    select,
+    textarea,
+    .ts-select,
+    .ts-highlight,
+    .ts-editor textarea {
+        font-size: 16px;
+    }
+}
