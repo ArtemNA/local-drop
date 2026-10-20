@@ -6,16 +6,18 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const os = require('os');
 const crypto = require('crypto');
-const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+// The largest legitimate message is a 512KB shared-text chunk; ws would
+// otherwise buffer frames of up to 100MB per message.
+const wss = new WebSocketServer({ server, maxPayload: 1024 * 1024 });
 
 // ── Maintenance mode ─────────────────────────────
-// Set to true to show maintenance page for all visitors.
-// WebSocket connections and /api/version still work so you can verify the deploy.
-const MAINTENANCE_MODE = false;
+// Set MAINTENANCE_MODE=true to show the maintenance page to all visitors
+// without a code change. WebSocket connections and /api/version still work so
+// you can verify the deploy.
+const MAINTENANCE_MODE = process.env.MAINTENANCE_MODE === 'true';
 
 app.use((req, res, next) => {
     if (MAINTENANCE_MODE
@@ -28,11 +30,10 @@ app.use((req, res, next) => {
 });
 // ─────────────────────────────────────────────────
 
-// Serve static files
-app.use(express.static('public'));
+// Serve static files (relative to this file, so the working directory doesn't matter)
+app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(express.json());
-app.use(cors());
 
 // Store rooms and clients
 const rooms = new Map(); // roomCode -> Set of clientIds
@@ -916,16 +917,18 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log('');
 });
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\n[Shutdown] Closing server...');
+// Graceful shutdown — SIGINT for Ctrl+C, SIGTERM for hosts like Render/Heroku
+function shutdown(signal) {
+    console.log(`\n[Shutdown] ${signal} received, closing server...`);
 
     // Notify all clients
     clients.forEach(client => {
-        client.ws.send(JSON.stringify({
-            type: 'server-shutdown',
-            message: 'Server is shutting down'
-        }));
+        if (client.ws.readyState === 1) {
+            client.ws.send(JSON.stringify({
+                type: 'server-shutdown',
+                message: 'Server is shutting down'
+            }));
+        }
         client.ws.close();
     });
 
@@ -933,4 +936,10 @@ process.on('SIGINT', () => {
         console.log('[Shutdown] Server closed');
         process.exit(0);
     });
-});
+
+    // Don't hang on lingering keep-alive connections
+    setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
