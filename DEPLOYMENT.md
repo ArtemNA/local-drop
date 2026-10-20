@@ -148,6 +148,7 @@ When users open this link, they automatically join room ABC123
 | `AUTO_ROOM_SECRET` | String | Key for auto-room codes; set it to keep codes stable across restarts (default: random per start) |
 | `TRUSTED_PROXY_HOPS` | Number | Reverse proxies in front of the app, used to read the client IP from `X-Forwarded-For` (default: 1) |
 | `MAINTENANCE_MODE` | true/false | Show the maintenance page to all visitors |
+| `CLIENT_IDLE_TIMEOUT_MS` | Number | Drop clients that sent nothing for this long, e.g. pages frozen by the browser (default: 150000) |
 
 ## Recommended Platforms
 
