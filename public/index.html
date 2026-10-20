@@ -189,6 +189,28 @@
         </div>
     </div>
 
+    <!-- Connection Verification Modal -->
+    <div id="verifyModal" class="modal hidden">
+        <div class="modal-content verify-content">
+            <div class="verify-header">
+                <h3>Verify connection</h3>
+                <button id="verifyCloseBtn" class="icon-btn" title="Close">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+            <p class="verify-peer">with <strong id="verifyPeerName"></strong></p>
+            <div id="verifyCode" class="verify-code">··· ···</div>
+            <p id="verifyText" class="verify-text"></p>
+            <div class="modal-actions">
+                <button id="verifyMatchBtn" class="btn btn-primary">Codes match</button>
+                <button id="verifyMismatchBtn" class="btn btn-secondary verify-mismatch">Codes differ</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Name Edit Modal -->
     <div id="nameModal" class="modal hidden">
         <div class="modal-content">
@@ -204,7 +226,7 @@
     <!-- Toast Container -->
     <div id="toastContainer" class="toast-container"></div>
 
-    <footer class="app-version" id="appVersion"><a href="changelog.html" id="appVersionLink" title="What's new">v2.3.0</a><span id="appDeploy"></span></footer>
+    <footer class="app-version" id="appVersion"><a href="changelog.html" id="appVersionLink" title="What's new">v2.4.0</a><span id="appDeploy"></span></footer>
 
     <!-- Syntax highlighting (optional — editor degrades to plain text if it fails to load, e.g. offline LAN) -->
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>

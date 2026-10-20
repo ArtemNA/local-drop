@@ -161,6 +161,20 @@ When deployed publicly, the app:
 - Server never sees file content
 - Automatic blocking of server transfer attempts
 
+### Verifying a Connection
+The encryption keys of a peer-to-peer connection are exchanged through the
+server, so a compromised server could try to sit in the middle. Press
+**Verify** on a connected device: both devices show a 6-digit code derived
+from the keys they actually use plus a random value from each side
+(committed before it is revealed, so it can't be brute-forced). Same code on
+both screens means a direct connection — press **Codes match** on each device.
+
+- Each device keeps one certificate (IndexedDB), so verified devices are
+  remembered and shown as verified on later connections.
+- **Codes differ** closes the connection and stops automatic reconnects.
+- This protects the connection itself. It can't protect against a server that
+  serves modified app code — for that, run the server yourself (local mode).
+
 ### Shared Text
 - **LAN only** (default): text travels over the same encrypted peer-to-peer
   connection as files, only to devices whose connection is verified as local.

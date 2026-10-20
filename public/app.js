@@ -40,6 +40,10 @@ const state = {
     sendWorkers: new Set(),     // peers we are currently sending files to (one file at a time each)
     currentReceive: new Map(),  // peerId -> transferId that incoming binary chunks belong to
     peerReconnects: new Map(),  // peerId -> WebRTC reconnect attempts since last success
+    certificate: null,          // this device's DTLS certificate (stable across sessions)
+    peerIdentity: new Map(),    // peerId -> verification state for the current connection
+    verifyInbox: new Map(),     // peerId -> verify messages that arrived before we were ready
+    untrustedPeers: new Set(),  // peers whose codes didn't match — no automatic reconnect
     localIP: null,
     peerLocality: new Map() // peerId -> 'verified' | 'confirmed' | 'blocked'
 };
@@ -97,6 +101,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     loadDeviceName();
     initSharedText();
+    setupVerifyDialog();
+    // Every connection must use this device's long-lived certificate (see
+    // "Connection verification"), so have it ready before connecting
+    state.certificate = await loadDeviceCertificate();
     initializeWebSocket();
     setupEventListeners();
     setupDragAndDrop();
@@ -378,12 +386,16 @@ function showRoomInfo(roomCode) {
 async function createConnection(peerId, isInitiator = true) {
     console.log(`Creating connection to ${peerId}, initiator: ${isInitiator}`);
     
-    const connection = new RTCPeerConnection({ 
+    const rtcConfig = {
         iceServers: CONFIG.iceServers,
         // Optional: Add more aggressive settings for better performance
         bundlePolicy: 'max-bundle',
         rtcpMuxPolicy: 'require'
-    });
+    };
+    if (state.certificate) {
+        rtcConfig.certificates = [state.certificate];
+    }
+    const connection = new RTCPeerConnection(rtcConfig);
     
     // See handleOffer (glare) and handleIceCandidate
     connection.makingOffer = isInitiator;
@@ -442,8 +454,10 @@ function setupDataChannel(dataChannel, peerId) {
     
     dataChannel.onopen = () => {
         console.log(`Data channel opened with ${peerId}`);
+        state.peerIdentity.delete(peerId); // new connection — new code
         updateDevicesList();
         onPeerRouteChecked(peerId);
+        startVerification(peerId, dataChannel);
 
         // Pick up transfers that were cut off by a dropped connection. The
         // receiver knows how much arrived, so it asks the sender to continue.
@@ -481,6 +495,11 @@ function setupDataChannel(dataChannel, peerId) {
 // Handle offer
 async function handleOffer(message) {
     const { fromId, offer } = message;
+
+    // Codes didn't match for this peer — only reconnect when the user asks
+    if (state.untrustedPeers.has(fromId)) {
+        return;
+    }
 
     // Both sides sent an offer at the same time (e.g. both have LAN-only shared
     // text on). The side with the smaller id keeps its own offer; the other drops
@@ -766,6 +785,349 @@ async function checkLocalityBeforeTransfer(peerId) {
     });
 }
 
+// ─────────────────────────────────────────────
+// Connection verification (protection against a man-in-the-middle)
+//
+// The data channel is encrypted with DTLS, but the certificate fingerprints that
+// authenticate it are exchanged through the signaling server — a malicious
+// server could put itself in the middle with its own certificates. To detect
+// that, both devices show a short code derived from the fingerprints they
+// actually see; if the users confirm the codes match, nobody is in between.
+//
+// A 6-digit code alone could be brute-forced by an attacker who picks
+// certificates until the codes collide, so the code also mixes in a random
+// nonce from each side, exchanged with a commitment (SAS / ZRTP style):
+//   A → B: commit = SHA-256(nonceA)        A commits before seeing nonceB
+//   B → A: nonceB
+//   A → B: nonceA                          B checks it against the commitment
+//   code  = SHA-256(fpA | fpB | nonceA | nonceB) → 6 digits
+// A man in the middle must fix its nonces before learning the other side's,
+// so it gets a single 1-in-a-million guess at matching codes.
+//
+// Each device keeps one certificate (IndexedDB), so a confirmed peer is
+// remembered by its fingerprint and shows as verified on later connections.
+// ─────────────────────────────────────────────
+
+const VERIFIED_PEERS_KEY = 'verifiedPeers';
+const CERT_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000; // browsers may cap this
+
+// SHA-256 → hex. crypto.subtle only exists on secure origins (https or
+// localhost); local mode is usually opened as http://<LAN IP>, so fall back to
+// a small JS implementation there.
+async function sha256Hex(text) {
+    const bytes = new TextEncoder().encode(text);
+    const digest = (window.crypto && crypto.subtle)
+        ? new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+        : sha256Js(bytes);
+    return [...digest].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Plain SHA-256 (FIPS 180-4) for insecure contexts
+function sha256Js(data) {
+    const primes = [];
+    for (let n = 2; primes.length < 64; n++) {
+        if (primes.every(p => n % p !== 0)) primes.push(n);
+    }
+    // Round constants / initial hash: fractional parts of cube / square roots of primes
+    const frac = x => ((x - Math.floor(x)) * 4294967296) >>> 0;
+    const K = primes.map(p => frac(Math.cbrt(p)));
+    const H = primes.slice(0, 8).map(p => frac(Math.sqrt(p)));
+
+    const bitLength = data.length * 8;
+    const total = ((data.length + 9 + 63) >> 6) << 6;
+    const buffer = new Uint8Array(total);
+    buffer.set(data);
+    buffer[data.length] = 0x80;
+    const view = new DataView(buffer.buffer);
+    view.setUint32(total - 8, Math.floor(bitLength / 4294967296));
+    view.setUint32(total - 4, bitLength >>> 0);
+
+    const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+    const W = new Uint32Array(64);
+    for (let offset = 0; offset < total; offset += 64) {
+        for (let i = 0; i < 16; i++) W[i] = view.getUint32(offset + i * 4);
+        for (let i = 16; i < 64; i++) {
+            const s0 = rotr(W[i - 15], 7) ^ rotr(W[i - 15], 18) ^ (W[i - 15] >>> 3);
+            const s1 = rotr(W[i - 2], 17) ^ rotr(W[i - 2], 19) ^ (W[i - 2] >>> 10);
+            W[i] = (W[i - 16] + s0 + W[i - 7] + s1) >>> 0;
+        }
+        let [a, b, c, d, e, f, g, h] = H;
+        for (let i = 0; i < 64; i++) {
+            const t1 = (h + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + W[i]) >>> 0;
+            const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+            h = g; g = f; f = e; e = (d + t1) >>> 0;
+            d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+        }
+        [a, b, c, d, e, f, g, h].forEach((v, i) => { H[i] = (H[i] + v) >>> 0; });
+    }
+
+    const out = new Uint8Array(32);
+    const outView = new DataView(out.buffer);
+    H.forEach((v, i) => outView.setUint32(i * 4, v));
+    return out;
+}
+
+function randomHex(byteCount) {
+    const bytes = crypto.getRandomValues(new Uint8Array(byteCount));
+    return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Load this device's DTLS certificate from IndexedDB, or create one. Without a
+// stable certificate a confirmed peer could not be recognized next time.
+function idbRequest(request) {
+    return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function loadDeviceCertificate() {
+    if (typeof RTCPeerConnection === 'undefined' || !RTCPeerConnection.generateCertificate) return null;
+    const generate = () => RTCPeerConnection.generateCertificate({
+        name: 'ECDSA',
+        namedCurve: 'P-256',
+        expires: CERT_LIFETIME_MS
+    });
+
+    try {
+        const openRequest = indexedDB.open('local-drop', 1);
+        openRequest.onupgradeneeded = () => openRequest.result.createObjectStore('keys');
+        const db = await idbRequest(openRequest);
+
+        let cert = await idbRequest(db.transaction('keys').objectStore('keys').get('dtls-certificate'));
+        // Renew a day before it expires (peers will need to verify again)
+        if (!cert || cert.expires < Date.now() + 24 * 60 * 60 * 1000) {
+            cert = await generate();
+            await idbRequest(db.transaction('keys', 'readwrite').objectStore('keys').put(cert, 'dtls-certificate'));
+        }
+        db.close();
+        return cert;
+    } catch (error) {
+        // Storage unavailable (private mode, Safari can't store certificates…):
+        // verification still works, it just isn't remembered across reloads
+        console.warn('Could not persist the device certificate:', error);
+        try {
+            return await generate();
+        } catch (_) {
+            return null;
+        }
+    }
+}
+
+function loadVerifiedPeers() {
+    try {
+        return JSON.parse(localStorage.getItem(VERIFIED_PEERS_KEY)) || {};
+    } catch (_) {
+        return {};
+    }
+}
+
+function rememberVerifiedPeer(fingerprint, name) {
+    const peers = loadVerifiedPeers();
+    peers[fingerprint] = { name, verifiedAt: Date.now() };
+    // Keep the list bounded — drop the oldest entries
+    const entries = Object.entries(peers).sort((a, b) => b[1].verifiedAt - a[1].verifiedAt).slice(0, 100);
+    try {
+        localStorage.setItem(VERIFIED_PEERS_KEY, JSON.stringify(Object.fromEntries(entries)));
+    } catch (_) { /* not persisted — still verified for this session */ }
+}
+
+// Fingerprints of the certificates actually used by the DTLS session
+async function getDtlsFingerprints(connection) {
+    let local = null;
+    let remote = null;
+    try {
+        const stats = await connection.getStats();
+        stats.forEach(report => {
+            if (report.type === 'transport' && report.localCertificateId && report.remoteCertificateId) {
+                local = stats.get(report.localCertificateId)?.fingerprint || local;
+                remote = stats.get(report.remoteCertificateId)?.fingerprint || remote;
+            }
+        });
+    } catch (_) { /* fall back to the SDP below */ }
+
+    // Fallback: the fingerprints negotiated in the SDP (DTLS enforces them)
+    const fromSdp = sdp => ((sdp || '').match(/a=fingerprint:\S+ ([0-9A-Fa-f:]+)/) || [])[1];
+    local = local || fromSdp(connection.localDescription?.sdp);
+    remote = remote || fromSdp(connection.remoteDescription?.sdp);
+
+    return local && remote ? { local: local.toUpperCase(), remote: remote.toUpperCase() } : null;
+}
+
+// Run the code exchange on a freshly opened data channel (both sides do this)
+async function startVerification(peerId, dataChannel) {
+    const connection = state.connections.get(peerId);
+    if (!connection) return;
+
+    const fingerprints = await getDtlsFingerprints(connection);
+    if (!fingerprints || state.dataChannels.get(peerId) !== dataChannel) return;
+
+    // Roles must come out opposite on both ends. Two tabs of one browser share
+    // a certificate, so break ties with the client ids.
+    const isA = fingerprints.local !== fingerprints.remote
+        ? fingerprints.local < fingerprints.remote
+        : (state.clientId || '') < peerId;
+
+    const v = {
+        dataChannel,
+        fingerprints,
+        role: isA ? 'A' : 'B',
+        nonce: randomHex(32),
+        theirCommit: null,
+        theirNonce: null,
+        code: null,
+        status: 'pending' // pending → ready | verified ; or mismatch / failed
+    };
+    state.peerIdentity.set(peerId, v);
+
+    if (v.role === 'A') {
+        sendVerifyMessage(v, { type: 'verify-commit', commit: await sha256Hex(v.nonce) });
+    }
+
+    // Messages that arrived while we were reading the fingerprints
+    const early = state.verifyInbox.get(peerId) || [];
+    state.verifyInbox.delete(peerId);
+    for (const message of early) {
+        await handleVerifyMessage(message, peerId);
+    }
+}
+
+function sendVerifyMessage(v, message) {
+    if (v.dataChannel.readyState === 'open') {
+        v.dataChannel.send(JSON.stringify(message));
+    }
+}
+
+async function handleVerifyMessage(message, peerId) {
+    const v = state.peerIdentity.get(peerId);
+    if (!v || v.dataChannel !== state.dataChannels.get(peerId)) {
+        // Not set up yet for this channel — keep it for startVerification
+        const inbox = state.verifyInbox.get(peerId) || [];
+        if (inbox.length < 5) inbox.push(message);
+        state.verifyInbox.set(peerId, inbox);
+        return;
+    }
+    if (v.status !== 'pending' || typeof message !== 'object') return;
+    const isHex = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+
+    if (v.role === 'B' && message.type === 'verify-commit' && isHex(message.commit) && !v.theirCommit) {
+        v.theirCommit = message.commit;
+        sendVerifyMessage(v, { type: 'verify-nonce', nonce: v.nonce });
+    } else if (v.role === 'A' && message.type === 'verify-nonce' && isHex(message.nonce) && !v.theirNonce) {
+        v.theirNonce = message.nonce;
+        sendVerifyMessage(v, { type: 'verify-reveal', nonce: v.nonce });
+        await finishVerification(peerId, v);
+    } else if (v.role === 'B' && message.type === 'verify-reveal' && isHex(message.nonce) && v.theirCommit) {
+        if (await sha256Hex(message.nonce) !== v.theirCommit) {
+            // The other side changed its nonce after seeing ours
+            v.status = 'failed';
+            updateDevicesList();
+            refreshVerifyDialog(peerId);
+            return;
+        }
+        v.theirNonce = message.nonce;
+        await finishVerification(peerId, v);
+    }
+}
+
+async function finishVerification(peerId, v) {
+    const { local, remote } = v.fingerprints;
+    const [fpA, fpB] = v.role === 'A' ? [local, remote] : [remote, local];
+    const [nonceA, nonceB] = v.role === 'A' ? [v.nonce, v.theirNonce] : [v.theirNonce, v.nonce];
+
+    const digest = await sha256Hex(`local-drop-sas-v1|${fpA}|${fpB}|${nonceA}|${nonceB}`);
+    const number = parseInt(digest.slice(0, 8), 16) % 1000000;
+    v.code = String(number).padStart(6, '0');
+
+    // Seen and confirmed before → trust it again without asking
+    v.status = loadVerifiedPeers()[remote] ? 'verified' : 'ready';
+    updateDevicesList();
+    refreshVerifyDialog(peerId);
+}
+
+// ── Verify dialog ──
+let verifyDialogPeer = null;
+
+function openVerifyDialog(peerId) {
+    verifyDialogPeer = peerId;
+    document.getElementById('verifyModal').classList.remove('hidden');
+    refreshVerifyDialog(peerId);
+}
+
+function closeVerifyDialog() {
+    verifyDialogPeer = null;
+    document.getElementById('verifyModal').classList.add('hidden');
+}
+
+function refreshVerifyDialog(peerId) {
+    if (verifyDialogPeer !== peerId) return;
+    const v = state.peerIdentity.get(peerId);
+    const peerName = state.peers.get(peerId)?.name || 'the other device';
+
+    const codeEl = document.getElementById('verifyCode');
+    const textEl = document.getElementById('verifyText');
+    const matchBtn = document.getElementById('verifyMatchBtn');
+    const mismatchBtn = document.getElementById('verifyMismatchBtn');
+
+    document.getElementById('verifyPeerName').textContent = peerName;
+    const ready = v && (v.status === 'ready' || v.status === 'verified');
+    codeEl.textContent = ready ? `${v.code.slice(0, 3)} ${v.code.slice(3)}` : '··· ···';
+    matchBtn.style.display = v && v.status === 'ready' ? '' : 'none';
+    mismatchBtn.style.display = v && v.status === 'ready' ? '' : 'none';
+
+    if (!v || v.status === 'pending') {
+        textEl.textContent = 'Calculating the code…';
+    } else if (v.status === 'ready') {
+        textEl.textContent = `Open this dialog on ${peerName} and compare. If both screens show the same code, nobody is intercepting the connection.`;
+    } else if (v.status === 'verified') {
+        textEl.textContent = `Verified — you confirmed this code for ${peerName}. It is remembered for future connections.`;
+    } else {
+        textEl.textContent = 'Verification failed: the other side did not follow the protocol. Do not trust this connection.';
+    }
+}
+
+function confirmCodesMatch() {
+    const peerId = verifyDialogPeer;
+    const v = state.peerIdentity.get(peerId);
+    if (!v || v.status !== 'ready') return;
+    v.status = 'verified';
+    rememberVerifiedPeer(v.fingerprints.remote, state.peers.get(peerId)?.name || '');
+    updateDevicesList();
+    refreshVerifyDialog(peerId);
+    showToast('Device verified', 'success');
+}
+
+// Different codes mean the connection runs through someone else: drop it and
+// don't reconnect automatically.
+function reportCodesMismatch() {
+    const peerId = verifyDialogPeer;
+    const v = state.peerIdentity.get(peerId);
+    if (!v) return;
+    v.status = 'mismatch';
+    state.untrustedPeers.add(peerId);
+    closeVerifyDialog();
+
+    const connection = state.connections.get(peerId);
+    if (connection) connection.close();
+    state.connections.delete(peerId);
+    state.dataChannels.delete(peerId);
+    interruptTransfers(peerId);
+    updateDevicesList();
+    showToast('Codes did not match — connection closed. Someone may be intercepting it.', 'error');
+}
+
+function setupVerifyDialog() {
+    document.getElementById('verifyMatchBtn').addEventListener('click', confirmCodesMatch);
+    document.getElementById('verifyMismatchBtn').addEventListener('click', reportCodesMismatch);
+    document.getElementById('verifyCloseBtn').addEventListener('click', closeVerifyDialog);
+    document.getElementById('verifyModal').addEventListener('click', (e) => {
+        if (e.target.id === 'verifyModal') closeVerifyDialog();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && verifyDialogPeer) closeVerifyDialog();
+    });
+}
+
 // File transfer functions
 //
 // Protocol over the data channel (JSON messages + raw binary chunks):
@@ -1046,6 +1408,12 @@ function handleDataChannelMessage(event, peerId) {
 
             case 'text-sync':
                 handleP2PTextChunk(message, peerId);
+                break;
+
+            case 'verify-commit':
+            case 'verify-nonce':
+            case 'verify-reveal':
+                handleVerifyMessage(message, peerId);
                 break;
         }
     } catch (error) {
@@ -1443,6 +1811,9 @@ function handlePeerDisconnect(peerId) {
     state.peers.delete(peerId);
     state.peerLocality.delete(peerId);
     state.peerReconnects.delete(peerId);
+    state.peerIdentity.delete(peerId);
+    state.verifyInbox.delete(peerId);
+    state.untrustedPeers.delete(peerId);
     state.sharedText.p2pIncoming.delete(peerId);
 
     // Close connection
@@ -1552,6 +1923,19 @@ function updateDevicesList() {
             statusText = 'Blocked (not local)';
         } else if (isConnected) {
             statusText = 'Click to send files';
+        } else if (state.untrustedPeers.has(peerId)) {
+            statusText = 'Codes didn\'t match — not connected';
+        }
+
+        // Verification (see "Connection verification")
+        const identity = state.peerIdentity.get(peerId);
+        let identityControl = '';
+        if (isConnected && identity && identity.status === 'verified') {
+            identityControl = '<button class="verify-btn verified" title="You confirmed the codes match">&#x2714; Verified</button>';
+        } else if (isConnected && identity && identity.status === 'failed') {
+            identityControl = '<button class="verify-btn failed" title="Verification failed">&#x26a0; Not trusted</button>';
+        } else if (isConnected) {
+            identityControl = '<button class="verify-btn" title="Compare a code on both devices">Verify</button>';
         }
 
         deviceCard.innerHTML = `
@@ -1563,10 +1947,19 @@ function updateDevicesList() {
             </div>
             <div class="device-name">${escapeHtml(peer.name)} ${localityIndicator}</div>
             <div class="device-status">${statusText}</div>
+            ${identityControl}
         `;
-        
-        deviceCard.addEventListener('click', () => {
+
+        deviceCard.addEventListener('click', (e) => {
+            if (e.target.closest('.verify-btn')) {
+                openVerifyDialog(peerId);
+                return;
+            }
             if (!isConnected) {
+                if (state.untrustedPeers.has(peerId)) {
+                    if (!confirm('The verification codes for this device did not match last time, so someone may be intercepting the connection. Connect anyway?')) return;
+                    state.untrustedPeers.delete(peerId);
+                }
                 connectToPeer(peerId);
             } else {
                 // Show file selection dialog for connected device
@@ -2209,6 +2602,7 @@ function getLanTextTargets() {
 function connectPeersForLanText() {
     if (!state.sharedText.lanOnly) return;
     state.peers.forEach((_, peerId) => {
+        if (state.untrustedPeers.has(peerId)) return;
         const conn = state.connections.get(peerId);
         if (conn && !['failed', 'closed', 'disconnected'].includes(conn.connectionState)) return;
         connectToPeer(peerId);

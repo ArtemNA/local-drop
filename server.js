@@ -809,7 +809,7 @@ function broadcastToRoom(roomCode, senderId, message) {
 }
 
 const SERVER_START_TIME = new Date().toISOString();
-const APP_VERSION = '2.3.0';
+const APP_VERSION = '2.4.0';
 
 // API endpoint to get server info
 app.get('/api/info', (req, res) => {
