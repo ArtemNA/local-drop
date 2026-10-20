@@ -1280,6 +1280,10 @@ body.dragging .device-card:not(.drag-over) {
     display: flex;
     align-items: center;
     gap: 8px;
+    margin-left: auto; /* title | … | controls | close */
+}
+.ts-close {
+    flex-shrink: 0;
 }
 .ts-select {
     padding: 6px 10px;
@@ -1447,6 +1451,59 @@ body.dragging .device-card:not(.drag-over) {
     .toast { min-width: 0; }
     .ts-editor { height: 46vh; }
     .shared-text-fab { right: 16px; bottom: 16px; }
+}
+
+/* Phones: the shared-text dialog becomes a full-screen sheet. The title and
+   close button stay on the first row, the LAN only switch and language on the
+   second, the editor takes all remaining height, Copy/Clear span the width. */
+@media (max-width: 495px) {
+    #textShareModal {
+        align-items: stretch;
+    }
+    .text-share-content {
+        width: 100%;
+        max-width: none;
+        height: 100vh;
+        height: 100dvh; /* excludes the mobile browser's toolbars */
+        margin: 0;
+        border-radius: 0;
+        padding: 14px 14px max(14px, env(safe-area-inset-bottom));
+        gap: 10px;
+    }
+    .ts-header {
+        flex-wrap: wrap;
+        row-gap: 10px;
+    }
+    .ts-header h3 {
+        flex: 1;
+        order: 1;
+    }
+    .ts-close {
+        order: 2;
+    }
+    .ts-controls {
+        order: 3;
+        flex-basis: 100%;
+        margin-left: 0;
+        justify-content: space-between;
+    }
+    .ts-hint {
+        font-size: 0.75rem;
+    }
+    .ts-editor {
+        flex: 1;
+        height: auto;
+        min-height: 160px;
+    }
+    .ts-footer {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 8px;
+    }
+    .ts-actions .btn {
+        flex: 1;
+        justify-content: center;
+    }
 }
 
 /* ── Editor surface + syntax token colors (theme-aware, self-contained) ── */
