@@ -487,7 +487,8 @@ function handleConnection(ws, req) {
         lastResetTime: Date.now(),
         textBytes: 0,
         textWindowStart: Date.now(),
-        textLimitNotified: false
+        textLimitNotified: false,
+        lastSeen: Date.now()    // last message from the client (see dropIdleClients)
     };
 
     clients.set(clientId, clientInfo);
@@ -545,6 +546,7 @@ function handleConnection(ws, req) {
     }
 
     ws.on('message', (data) => {
+        clientInfo.lastSeen = Date.now();
         try {
             const messageSize = data.length;
 
@@ -922,6 +924,30 @@ function sweepSharedTexts() {
 }
 
 setInterval(sweepSharedTexts, 60 * 1000);
+
+// ── Idle clients ─────────────────────────────────
+// Open pages send a 'ping' every 30s (less often in background tabs, which
+// browsers throttle to about once a minute — the timeout leaves room for two
+// missed pings there, so minimizing the browser doesn't disconnect anyone).
+// A client that has been silent much longer is a page that's frozen
+// (back/forward cache, a suspended phone browser) or gone without a clean
+// close — its socket can stay open for a long time and it would linger as a
+// phantom device. WebSocket-level pings don't help: browsers answer those
+// even for a frozen page. Leaving a page normally is handled at once by the
+// client closing its socket on pagehide.
+const CLIENT_IDLE_TIMEOUT_MS = parseInt(process.env.CLIENT_IDLE_TIMEOUT_MS || '150000', 10);
+
+function dropIdleClients() {
+    const now = Date.now();
+    clients.forEach(client => {
+        if (now - client.lastSeen > CLIENT_IDLE_TIMEOUT_MS) {
+            console.log(`[Idle] Dropping silent client ${client.id}`);
+            client.ws.terminate(); // 'close' handler does the cleanup and tells peers
+        }
+    });
+}
+
+setInterval(dropIdleClients, Math.min(30 * 1000, Math.max(100, Math.floor(CLIENT_IDLE_TIMEOUT_MS / 3))));
 
 // Start server
 const PORT = process.env.PORT || 3000;

@@ -263,6 +263,29 @@ describe('same-network hint', () => {
     });
 });
 
+describe('idle clients', () => {
+    let server;
+    before(async () => { server = startServer({ CLIENT_IDLE_TIMEOUT_MS: '600' }); await server.ready; });
+    after(() => server.stop());
+
+    it('drops a client that stops talking and tells the others; keeps one that pings', async () => {
+        const silent = await connect(server.port);  // like a page frozen in the back/forward cache
+        const alive = await connect(server.port);
+        const silentId = ofType(silent, 'init')[0].clientId;
+        const pinger = setInterval(() => alive.send(JSON.stringify({ type: 'ping' })), 200);
+
+        const closed = new Promise(resolve => silent.on('close', resolve));
+        await closed;
+        await sleep(100); // let the peer-left notice arrive
+        clearInterval(pinger);
+
+        assert.strictEqual(alive.readyState, WebSocket.OPEN);
+        assert.ok(ofType(alive, 'peer-left').some(m => m.peerId === silentId));
+        assert.strictEqual((await getInfo(server.port)).totalClients, 1);
+        alive.terminate();
+    });
+});
+
 describe('auto rooms', () => {
     let server;
     before(async () => { server = startServer({ PUBLIC_DEPLOY: 'true', AUTO_ROOM: 'true' }); await server.ready; });

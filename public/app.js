@@ -117,6 +117,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     loadVersionInfo();
 });
 
+// Leaving the page — navigation, reload, closing the tab, or the browser
+// putting it into the back/forward cache. Close the connections right away:
+// a page frozen in that cache would otherwise keep its WebSocket open and
+// linger on other devices as a copy of this one.
+window.addEventListener('pagehide', () => {
+    state.leaving = true;
+    stopPingInterval();
+    state.connections.forEach(connection => connection.close());
+    if (state.ws) {
+        state.ws.close(1000, 'Page closed');
+    }
+});
+
+// Restored from the back/forward cache: its connections were closed on
+// pagehide, so start over with a fresh page
+window.addEventListener('pageshow', (event) => {
+    if (event.persisted) {
+        location.reload();
+    }
+});
+
 // Theme management
 function initializeTheme() {
     const savedTheme = localStorage.getItem('theme') || 'dark';
@@ -175,6 +196,7 @@ function initializeWebSocket() {
     
     state.ws.onclose = () => {
         console.log('WebSocket disconnected');
+        if (state.leaving) return; // closed on purpose in pagehide
         updateConnectionStatus(false);
         stopPingInterval();
         
