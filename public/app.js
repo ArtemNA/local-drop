@@ -1660,7 +1660,8 @@ function addTransferToUI(transfer) {
         <div class="transfer-actions"></div>
     `;
 
-    transferQueue.appendChild(transferItem);
+    // Newest on top, so the transfer you just started is always visible
+    transferQueue.prepend(transferItem);
     updateTransferUI(transfer);
 }
 
@@ -2034,10 +2035,12 @@ function initSharedText() {
 
     if (!ts.fab || !ts.modal || !ts.textarea) return;
 
-    // LAN-only is a per-device preference, off by default
+    // LAN-only is a per-device preference, on by default (keeping data inside
+    // the local network is the point of the app); an explicit choice is kept
+    state.sharedText.lanOnly = true;
     try {
-        state.sharedText.lanOnly = localStorage.getItem('sharedTextLanOnly') === '1';
-    } catch (_) { /* storage unavailable — stay off */ }
+        state.sharedText.lanOnly = localStorage.getItem('sharedTextLanOnly') !== '0';
+    } catch (_) { /* storage unavailable — keep the default */ }
     if (ts.lanToggle) {
         ts.lanToggle.checked = state.sharedText.lanOnly;
         ts.lanToggle.addEventListener('change', () => setLanOnlyText(ts.lanToggle.checked));
