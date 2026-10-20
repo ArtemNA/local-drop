@@ -38,9 +38,9 @@ function startServer(env = {}) {
     };
 }
 
-function connect(port, query = '') {
+function connect(port, query = '', headers = {}) {
     return new Promise((resolve, reject) => {
-        const ws = new WebSocket(`ws://127.0.0.1:${port}/${query}`);
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/${query}`, { headers });
         ws.messages = [];
         ws.on('message', m => ws.messages.push(JSON.parse(m)));
         ws.on('open', () => resolve(ws));
@@ -225,6 +225,41 @@ describe('public mode rooms', () => {
         assert.ok(ofType(ws, 'room-created').length <= 20);
         assert.ok(errorCodes(ws).includes('ROOM_LIMIT'));
         ws.terminate();
+    });
+});
+
+describe('same-network hint', () => {
+    let server;
+    before(async () => { server = startServer(); await server.ready; });
+    after(() => server.stop());
+
+    // The server reads the client IP from X-Forwarded-For (as behind a proxy)
+    async function hintBetween(ipA, ipB) {
+        const a = await connect(server.port, '', { 'X-Forwarded-For': ipA });
+        await sleep(50);
+        const b = await connect(server.port, '', { 'X-Forwarded-For': ipB });
+        await sleep(100);
+        const bSeesA = ofType(b, 'init')[0].peers.find(p => p.id === ofType(a, 'init')[0].clientId);
+        const aSeesB = ofType(a, 'peer-joined').find(m => m.peer.id === ofType(b, 'init')[0].clientId);
+        [a, b].forEach(ws => ws.terminate());
+        await sleep(50);
+        assert.strictEqual(bSeesA.sameNetwork, aSeesB.peer.sameNetwork); // symmetric
+        return bSeesA.sameNetwork;
+    }
+
+    it('is true behind the same public IPv4 and false for different ones', async () => {
+        assert.strictEqual(await hintBetween('203.0.113.5', '203.0.113.5'), true);
+        assert.strictEqual(await hintBetween('203.0.113.5', '198.51.100.7'), false);
+    });
+
+    it('compares IPv6 by /64 prefix', async () => {
+        assert.strictEqual(await hintBetween('2001:db8:1:2::5', '2001:db8:1:2:abcd::9'), true);
+        assert.strictEqual(await hintBetween('2001:db8:1:2::5', '2001:db8:1:3::5'), false);
+    });
+
+    it('matches private addresses in the same /24 (server inside the LAN)', async () => {
+        assert.strictEqual(await hintBetween('192.168.1.10', '192.168.1.20'), true);
+        assert.strictEqual(await hintBetween('192.168.1.10', '192.168.2.20'), false);
     });
 });
 

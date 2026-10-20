@@ -96,6 +96,60 @@ function getClientIp(req) {
     return ip.replace(/^::ffff:/, ''); // Clean IPv6 prefix
 }
 
+// "2001:db8::1" → "2001:db8:0:0", the /64 network a home router hands out
+function ipv6Prefix64(ip) {
+    const halves = ip.split('%')[0].toLowerCase().split('::');
+    if (halves.length > 2) return null;
+    const head = halves[0] ? halves[0].split(':') : [];
+    const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+    const missing = 8 - head.length - tail.length;
+    if (halves.length === 1 ? head.length !== 8 : missing < 0) return null;
+    const groups = [...head, ...new Array(halves.length === 2 ? missing : 0).fill('0'), ...tail];
+    if (!groups.every(g => /^[0-9a-f]{1,4}$/.test(g))) return null;
+    return groups.slice(0, 4).map(g => parseInt(g, 16).toString(16)).join(':');
+}
+
+const PRIVATE_IPV4_RE = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.)/;
+
+// Whether two clients look like they are on the same network: the same public
+// IPv4 (one router/NAT), the same IPv6 /64, or — when this server runs inside
+// the LAN — the same private /24. Only a hint for the browser's locality check
+// (public/app.js), which also looks at the actual WebRTC route.
+function sameNetwork(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    const isV6 = ip => ip.includes(':');
+    if (isV6(a) && isV6(b)) {
+        const prefix = ipv6Prefix64(a);
+        return !!prefix && prefix === ipv6Prefix64(b);
+    }
+    if (!isV6(a) && !isV6(b) && PRIVATE_IPV4_RE.test(a) && PRIVATE_IPV4_RE.test(b)) {
+        return a.split('.').slice(0, 3).join('.') === b.split('.').slice(0, 3).join('.');
+    }
+    return false;
+}
+
+// How `peer` is described to `recipient`
+function peerInfoFor(recipient, peer) {
+    return {
+        id: peer.id,
+        name: peer.name,
+        sameNetwork: sameNetwork(recipient.ip, peer.ip)
+    };
+}
+
+// Tell each recipient that clientInfo joined (the sameNetwork hint differs per recipient)
+function announcePeer(clientInfo, recipients) {
+    recipients.forEach(recipient => {
+        if (recipient.id !== clientInfo.id && recipient.ws.readyState === 1) {
+            recipient.ws.send(JSON.stringify({
+                type: 'peer-joined',
+                peer: peerInfoFor(recipient, clientInfo)
+            }));
+        }
+    });
+}
+
 // Rooms: 6 uppercase letters/digits. New rooms count against a per-IP limit so
 // one client can't fill the server with empty rooms.
 const ROOM_CODE_RE = /^[A-Z0-9]{6}$/;
@@ -147,21 +201,12 @@ function joinRoom(clientInfo, roomCode, extra = {}) {
         clientInfo.roomCode = roomCode;
         console.log(`[Room] Client ${clientInfo.id} joined room ${roomCode}`);
 
-        broadcastToRoom(roomCode, clientInfo.id, {
-            type: 'peer-joined',
-            peer: {
-                id: clientInfo.id,
-                name: clientInfo.name
-            }
-        });
+        announcePeer(clientInfo, getClientsInRoom(roomCode));
     }
 
     const peersInRoom = getClientsInRoom(roomCode)
         .filter(client => client.id !== clientInfo.id)
-        .map(client => ({
-            id: client.id,
-            name: client.name
-        }));
+        .map(client => peerInfoFor(clientInfo, client));
 
     clientInfo.ws.send(JSON.stringify({
         type: 'room-joined',
@@ -469,25 +514,16 @@ function handleConnection(ws, req) {
             clientId: clientId,
             deviceName: clientInfo.name,
             localMode: true,
-            peers: Array.from(clients.entries())
-                .filter(([id]) => id !== clientId)
-                .map(([id, info]) => ({
-                    id: id,
-                    name: info.name
-                }))
+            peers: Array.from(clients.values())
+                .filter(info => info.id !== clientId)
+                .map(info => peerInfoFor(clientInfo, info))
         }));
 
         // Catch the new device up on the current shared text (if any)
         streamSnapshotTo(clientInfo, 'LOCAL');
 
         // Notify other clients about new peer
-        broadcast(clientId, {
-            type: 'peer-joined',
-            peer: {
-                id: clientId,
-                name: clientInfo.name
-            }
-        });
+        announcePeer(clientInfo, Array.from(clients.values()));
     } else if (urlRoomCode) {
         // PUBLIC MODE - Join specific room from URL; on an invalid code or the
         // room limit, fall back to room selection
