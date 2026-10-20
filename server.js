@@ -306,11 +306,33 @@ async function streamSnapshotTo(clientInfo, key) {
     }
 }
 
+// Device names come from clients: decode leniently, strip control characters
+// and cap the length. Falls back when nothing usable is left.
+function sanitizeName(raw, fallback) {
+    if (typeof raw !== 'string') return fallback;
+    let name = raw;
+    try {
+        name = decodeURIComponent(raw); // the client percent-encodes the name once more
+    } catch (_) { /* malformed escape — use as-is */ }
+    name = name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 30);
+    return name || fallback;
+}
+
+// A throw while setting up one connection must not take the whole server down.
 wss.on('connection', (ws, req) => {
+    try {
+        handleConnection(ws, req);
+    } catch (error) {
+        console.error('[Error] Failed to set up connection:', error.message);
+        ws.terminate();
+    }
+});
+
+function handleConnection(ws, req) {
     const clientId = uuidv4();
 
-    // Parse URL parameters
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    // Parse URL parameters (fixed base: the Host header is client-controlled)
+    const url = new URL(req.url, 'http://localhost');
     const urlRoomCode = url.searchParams.get('room');
     const clientLocalIP = url.searchParams.get('localIP');
     const deviceName = url.searchParams.get('deviceName');
@@ -327,7 +349,7 @@ wss.on('connection', (ws, req) => {
     const clientInfo = {
         id: clientId,
         ws: ws,
-        name: deviceName ? decodeURIComponent(deviceName) : `Device-${clientId.slice(0, 6)}`,
+        name: sanitizeName(deviceName, `Device-${clientId.slice(0, 6)}`),
         ip: clientIp,
         localIP: clientLocalIP, // Store client's local IP for auto-room
         roomCode: null,
@@ -597,7 +619,7 @@ wss.on('connection', (ws, req) => {
                     break;
 
                 case 'join-room':
-                    if (PUBLIC_DEPLOY) {
+                    if (PUBLIC_DEPLOY && typeof message.roomCode === 'string') {
                         // Normalize room code to uppercase
                         const normalizedCode = message.roomCode.toUpperCase();
                         handleJoinRoom(clientInfo, normalizedCode);
@@ -605,7 +627,8 @@ wss.on('connection', (ws, req) => {
                     break;
 
                 case 'set-name':
-                    clientInfo.name = message.name.slice(0, 30); // Limit name length
+                    if (typeof message.name !== 'string') break;
+                    clientInfo.name = sanitizeName(message.name, clientInfo.name);
 
                     if (PUBLIC_DEPLOY && clientInfo.roomCode) {
                         // Broadcast to room members only (public mode)
@@ -632,7 +655,7 @@ wss.on('connection', (ws, req) => {
                 case 'answer':
                 case 'ice-candidate':
                     // Forward signaling messages to target peer
-                    if (message.targetId && clients.has(message.targetId)) {
+                    if (typeof message.targetId === 'string' && clients.has(message.targetId)) {
                         const targetClient = clients.get(message.targetId);
 
                         // Check room compatibility based on mode
@@ -647,6 +670,7 @@ wss.on('connection', (ws, req) => {
                         }
 
                         if (canCommunicate) {
+                            if (targetClient.ws.readyState !== 1) break;
                             targetClient.ws.send(JSON.stringify({
                                 ...message,
                                 fromId: clientId,
@@ -699,7 +723,7 @@ wss.on('connection', (ws, req) => {
     ws.on('error', (error) => {
         console.error(`[Error] WebSocket error for ${clientId}:`, error.message);
     });
-});
+}
 
 // Handle room creation
 function handleCreateRoom(clientInfo) {
