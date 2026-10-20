@@ -385,8 +385,11 @@ async function createConnection(peerId, isInitiator = true) {
         rtcpMuxPolicy: 'require'
     });
     
+    // See handleOffer (glare) and handleIceCandidate
+    connection.makingOffer = isInitiator;
+    connection.pendingCandidates = [];
     state.connections.set(peerId, connection);
-    
+
     // Handle ICE candidates
     connection.onicecandidate = (event) => {
         if (event.candidate && state.ws.readyState === WebSocket.OPEN) {
@@ -481,19 +484,24 @@ async function handleOffer(message) {
 
     // Both sides sent an offer at the same time (e.g. both have LAN-only shared
     // text on). The side with the smaller id keeps its own offer; the other drops
-    // its own connection and answers instead.
+    // its own connection and answers instead. "Making an offer" counts from the
+    // moment the connection is created — setLocalDescription is async, and the
+    // peer's offer can arrive before it finishes.
     const existing = state.connections.get(fromId);
-    if (existing && existing.signalingState === 'have-local-offer') {
-        if (state.clientId && state.clientId < fromId) {
+    if (existing) {
+        const collision = existing.makingOffer || existing.signalingState === 'have-local-offer';
+        if (collision && state.clientId && state.clientId < fromId) {
             return;
         }
+        // Yielding, or the peer started over (e.g. after a dropped connection)
         existing.close();
     }
 
     try {
         const connection = await createConnection(fromId, false);
         await connection.setRemoteDescription(new RTCSessionDescription(offer));
-        
+        await flushPendingCandidates(connection);
+
         const answer = await connection.createAnswer();
         await connection.setLocalDescription(answer);
         
@@ -514,10 +522,13 @@ async function handleOffer(message) {
 async function handleAnswer(message) {
     const { fromId, answer } = message;
     const connection = state.connections.get(fromId);
-    
-    if (connection) {
+
+    // Only a connection waiting for an answer can take one (an answer to an
+    // offer we dropped while yielding is stale)
+    if (connection && connection.signalingState === 'have-local-offer') {
         try {
             await connection.setRemoteDescription(new RTCSessionDescription(answer));
+            await flushPendingCandidates(connection);
         } catch (error) {
             console.error('Error handling answer:', error);
         }
@@ -528,8 +539,14 @@ async function handleAnswer(message) {
 async function handleIceCandidate(message) {
     const { fromId, candidate } = message;
     const connection = state.connections.get(fromId);
-    
+
     if (connection) {
+        // Candidates can overtake the offer/answer — hold them until the
+        // remote description is set
+        if (!connection.remoteDescription) {
+            connection.pendingCandidates.push(candidate);
+            return;
+        }
         try {
             await connection.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (error) {
@@ -538,27 +555,47 @@ async function handleIceCandidate(message) {
     }
 }
 
+async function flushPendingCandidates(connection) {
+    const pending = connection.pendingCandidates.splice(0);
+    for (const candidate of pending) {
+        try {
+            await connection.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (error) {
+            // Typically from a connection the peer already replaced
+            console.warn('Dropped stale ICE candidate:', error.message);
+        }
+    }
+}
+
 // Initiate connection with peer
 async function connectToPeer(peerId) {
-    if (state.connections.has(peerId)) {
-        const existingConn = state.connections.get(peerId);
+    const existingConn = state.connections.get(peerId);
+    if (existingConn) {
         if (existingConn.connectionState === 'connected') {
             console.log(`Already connected to ${peerId}`);
             return;
         }
+        if (existingConn.connectionState === 'new' || existingConn.connectionState === 'connecting') {
+            return; // already on its way
+        }
+        existingConn.close();
     }
-    
+
     try {
         const connection = await createConnection(peerId, true);
-        const offer = await connection.createOffer();
-        await connection.setLocalDescription(offer);
-        
-        if (state.ws.readyState === WebSocket.OPEN) {
-            state.ws.send(JSON.stringify({
-                type: 'offer',
-                targetId: peerId,
-                offer: offer
-            }));
+        try {
+            const offer = await connection.createOffer();
+            await connection.setLocalDescription(offer);
+
+            if (state.ws.readyState === WebSocket.OPEN) {
+                state.ws.send(JSON.stringify({
+                    type: 'offer',
+                    targetId: peerId,
+                    offer: offer
+                }));
+            }
+        } finally {
+            connection.makingOffer = false;
         }
     } catch (error) {
         console.error('Error connecting to peer:', error);
