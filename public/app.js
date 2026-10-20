@@ -44,6 +44,7 @@ const state = {
     peerIdentity: new Map(),    // peerId -> verification state for the current connection
     verifyInbox: new Map(),     // peerId -> verify messages that arrived before we were ready
     untrustedPeers: new Set(),  // peers whose codes didn't match — no automatic reconnect
+    peerPolicy: new Map(),      // peerId -> { lanOnly } as announced by the peer
     localIP: null,
     peerLocality: new Map(), // peerId -> 'verified' | 'unverified' | 'confirmed' | 'blocked'
     localityChecks: new Map(), // peerId -> promise of the running locality check
@@ -466,6 +467,7 @@ function setupDataChannel(dataChannel, peerId) {
         updateDevicesList();
         onPeerRouteChecked(peerId);
         startVerification(peerId, dataChannel);
+        sendPolicy(dataChannel);
 
         // Pick up transfers that were cut off by a dropped connection. The
         // receiver knows how much arrived, so it asks the sender to continue.
@@ -792,6 +794,11 @@ async function checkLocalityBeforeTransfer(peerId) {
         return false;
     }
 
+    if (peerRefusesOurFiles(peerId)) {
+        showToast(`${peerName} only accepts files over its local network (LAN only)`, 'warning');
+        return false;
+    }
+
     if (locality === 'verified' || locality === 'confirmed') {
         return true;
     }
@@ -829,6 +836,25 @@ async function checkLocalityBeforeTransfer(peerId) {
             resolve(false);
         };
     });
+}
+
+// Devices tell each other whether they are in LAN only mode, so a sender knows
+// up front that a LAN-only receiver would refuse a file over the internet
+function sendPolicy(dataChannel) {
+    if (dataChannel && dataChannel.readyState === 'open') {
+        dataChannel.send(JSON.stringify({ type: 'peer-policy', lanOnly: state.lanOnly }));
+    }
+}
+
+function handlePeerPolicy(message, peerId) {
+    state.peerPolicy.set(peerId, { lanOnly: message.lanOnly === true });
+    updateDevicesList();
+}
+
+// The peer would refuse our files: it's in LAN only mode and our route to it isn't local
+function peerRefusesOurFiles(peerId) {
+    const locality = state.peerLocality.get(peerId);
+    return state.peerPolicy.get(peerId)?.lanOnly === true && locality !== undefined && locality !== 'verified';
 }
 
 // Receiver side of LAN only: refuse a file from a peer whose route isn't local
@@ -1379,12 +1405,39 @@ async function startFileSend(transfer) {
         return;
     }
 
-    transfer.status = 'completed';
+    // Everything is sent, but it only counts once the receiver confirms it saved
+    // the file — it may still refuse it (LAN only) or find it incomplete
+    transfer.status = 'confirming';
     transfer.progress = 100;
     updateTransferUI(transfer);
-    showToast(`Sent ${transfer.fileName}`, 'success');
     // Re-added if the receiver turns out to be missing data and asks to resume
     removeFromQueue(transfer);
+
+    clearTimeout(transfer.ackTimer);
+    transfer.ackTimer = setTimeout(() => {
+        // No answer (a receiver on an older version, or still saving a huge
+        // file): it was delivered as far as we can tell
+        if (transfer.status === 'confirming') {
+            transfer.status = 'completed';
+            transfer.unconfirmed = true;
+            updateTransferUI(transfer);
+        }
+    }, FILE_ACK_TIMEOUT_MS);
+}
+
+const FILE_ACK_TIMEOUT_MS = 5 * 60 * 1000;
+
+// Sender: the receiver saved the file
+function handleFileAck(message, peerId) {
+    const transfer = getPeerTransfer(message.transferId, peerId, 'send');
+    if (!transfer) return;
+    if (transfer.status !== 'confirming' && !(transfer.status === 'completed' && transfer.unconfirmed)) return;
+
+    clearTimeout(transfer.ackTimer);
+    transfer.status = 'completed';
+    transfer.unconfirmed = false;
+    updateTransferUI(transfer);
+    showToast(`Sent ${transfer.fileName}`, 'success');
 }
 
 // Get effective chunk size for a connection, respecting SCTP maxMessageSize
@@ -1459,6 +1512,14 @@ function handleDataChannelMessage(event, peerId) {
 
             case 'transfer-resume':
                 handleTransferResume(message, peerId);
+                break;
+
+            case 'file-ack':
+                handleFileAck(message, peerId);
+                break;
+
+            case 'peer-policy':
+                handlePeerPolicy(message, peerId);
                 break;
 
             case 'transfer-resume-request':
@@ -1657,6 +1718,7 @@ async function handleFileEnd(message, peerId) {
         transfer.status = 'failed';
         await discardReceivedData(transfer);
         updateTransferUI(transfer);
+        notifyPeer(transfer, 'transfer-cancel', { reason: 'incomplete' });
         showToast(`Transfer corrupted: ${transfer.fileName} (incomplete)`, 'error');
         return;
     }
@@ -1668,6 +1730,7 @@ async function handleFileEnd(message, peerId) {
             console.error('Error closing writable stream:', err);
             transfer.status = 'failed';
             updateTransferUI(transfer);
+            notifyPeer(transfer, 'transfer-cancel', { reason: 'save-failed' });
             showToast(`Failed to save ${transfer.fileName}`, 'error');
             return;
         }
@@ -1692,6 +1755,8 @@ async function handleFileEnd(message, peerId) {
     transfer.progress = 100;
     transfer.canSaveToDisk = false;
     updateTransferUI(transfer);
+    // Only now may the sender call it sent
+    notifyPeer(transfer, 'file-ack');
 
     showToast(`Received ${transfer.fileName}`, 'success');
 }
@@ -1835,6 +1900,7 @@ function cancelTransfer(transferId) {
 // Free what a stopped transfer holds
 function stopTransferLocally(transfer) {
     removeFromQueue(transfer);
+    clearTimeout(transfer.ackTimer);
     if (transfer.direction === 'receive') {
         discardReceivedData(transfer);
         if (state.currentReceive.get(transfer.peerId) === transfer.id) {
@@ -1847,15 +1913,21 @@ function stopTransferLocally(transfer) {
 function handleTransferCancel(message, peerId) {
     const transfer = state.activeTransfers.get(message.transferId);
 
-    if (transfer && transfer.peerId === peerId &&
-        transfer.status !== 'completed' && transfer.status !== 'cancelled') {
-        transfer.status = 'cancelled';
+    // A "completed" send that was never confirmed can still be refused
+    if (transfer && transfer.peerId === peerId && transfer.status !== 'cancelled' &&
+        (transfer.status !== 'completed' || transfer.unconfirmed)) {
+        const peerName = state.peers.get(peerId)?.name || 'device';
+        const failed = message.reason === 'incomplete' || message.reason === 'save-failed';
+        transfer.status = failed ? 'failed' : 'cancelled';
+        transfer.unconfirmed = false;
         stopTransferLocally(transfer);
         updateTransferUI(transfer);
-        const peerName = state.peers.get(peerId)?.name || 'device';
-        showToast(message.reason === 'lan-only'
-            ? `${peerName} only accepts files over the local network (LAN only)`
-            : `Transfer cancelled by ${peerName}`, 'warning');
+        const reasons = {
+            'lan-only': `${peerName} only accepts files over its local network (LAN only)`,
+            'incomplete': `${peerName} received ${transfer.fileName} incomplete — send it again`,
+            'save-failed': `${peerName} could not save ${transfer.fileName}`
+        };
+        showToast(reasons[message.reason] || `Transfer cancelled by ${peerName}`, failed ? 'error' : 'warning');
     }
 }
 
@@ -1882,6 +1954,7 @@ function handlePeerDisconnect(peerId) {
     state.verifyInbox.delete(peerId);
     state.untrustedPeers.delete(peerId);
     state.localityChecks.delete(peerId);
+    state.peerPolicy.delete(peerId);
     state.sharedText.p2pIncoming.delete(peerId);
 
     // Close connection
@@ -1992,11 +2065,20 @@ function updateDevicesList() {
         const lanBlocked = isConnected && state.lanOnly && locality !== undefined &&
             locality !== 'verified';
 
+        // ...and a LAN-only peer refuses our files over a non-local route
+        const refusedByPeer = isConnected && !lanBlocked && peerRefusesOurFiles(peerId);
+        const cannotSend = (isConnected && locality === 'blocked') || lanBlocked || refusedByPeer;
+        if (cannotSend) {
+            deviceCard.classList.add('no-send'); // hides the "send" badge
+        }
+
         let statusText = 'Click to connect';
         if (isConnected && locality === 'blocked') {
             statusText = 'Blocked (not local)';
         } else if (lanBlocked) {
             statusText = 'Not on your local network';
+        } else if (refusedByPeer) {
+            statusText = 'Accepts files only on its local network';
         } else if (isConnected) {
             statusText = 'Click to send files';
         } else if (state.untrustedPeers.has(peerId)) {
@@ -2021,8 +2103,8 @@ function updateDevicesList() {
                     <line x1="12" y1="18" x2="12" y2="18"></line>
                 </svg>
             </div>
-            <div class="device-name">${escapeHtml(peer.name)} ${localityIndicator}</div>
-            <div class="device-status">${statusText}</div>
+            <div class="device-name"><span class="device-name-text">${escapeHtml(peer.name)}</span> ${localityIndicator}</div>
+            <div class="device-status${cannotSend ? ' warning' : ''}">${statusText}</div>
             ${identityControl}
         `;
 
@@ -2039,6 +2121,8 @@ function updateDevicesList() {
                 connectToPeer(peerId);
             } else if (lanBlocked) {
                 showToast(`${peer.name} is not verified to be on your local network. Turn off "LAN only" to send over the internet.`, 'warning');
+            } else if (refusedByPeer) {
+                showToast(`${peer.name} only accepts files over its local network (LAN only)`, 'warning');
             } else {
                 // Show file selection dialog for connected device
                 openFilePicker(peerId);
@@ -2188,6 +2272,8 @@ function updateTransferUI(transfer) {
     
     const statusLabel = transfer.awaitingResume ? 'resuming'
         : (transfer.status === 'paused' && transfer.interrupted) ? 'interrupted'
+        : transfer.status === 'confirming' ? 'waiting for receiver'
+        : (transfer.status === 'completed' && transfer.unconfirmed) ? 'sent (unconfirmed)'
         : transfer.status;
     statusElement.className = `transfer-status ${transfer.status}`;
     statusElement.textContent = statusLabel;
@@ -2221,7 +2307,7 @@ function updateTransferUI(transfer) {
         actionsHTML += `<button onclick="pauseTransfer('${transfer.id}')">Pause</button>`;
     }
 
-    if (transfer.status !== 'completed' && transfer.status !== 'cancelled') {
+    if (!['completed', 'cancelled', 'confirming'].includes(transfer.status)) {
         actionsHTML += `<button onclick="cancelTransfer('${transfer.id}')">${transfer.status === 'failed' ? 'Dismiss' : 'Cancel'}</button>`;
     }
 
@@ -2673,6 +2759,7 @@ function setLanOnly(on) {
     updateSharedHint();
     updateSharedStatus(true);
     updateDevicesList();
+    state.dataChannels.forEach(dc => sendPolicy(dc));
 
     if (state.lanOnly) {
         connectPeersForLanText();
