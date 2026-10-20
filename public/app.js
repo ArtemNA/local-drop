@@ -2106,7 +2106,8 @@ function escapeHtml(str) {
 const TS_HIGHLIGHT_MAX = 100 * 1024;
 const TS_CHUNK_SIZE = 128 * 1024;         // base64 chars per outgoing chunk
 const TS_MAX_CHARS = 80 * 1024 * 1024;    // hard client cap on raw text length
-const TS_P2P_CHUNK_SIZE = 64 * 1024;      // base64 chars per data-channel message (well under SCTP limits)
+const TS_SERVER_MAX_B64 = 10 * 1024 * 1024; // mirrors MAX_TEXT_TOTAL on the server
+const TS_P2P_CHUNK_SIZE = 64 * 1024;     // base64 chars per data-channel message (well under SCTP limits)
 const TS_P2P_MAX_CHUNKS = 2000;           // reject absurd incoming chunk counts
 
 function renderSharedHighlight() {
@@ -2232,6 +2233,11 @@ function sendSharedText(immediate) {
         try {
             state.sharedText.sending = true;
             const { enc, b64 } = await encodeSharedText(text);
+            if (b64.length > TS_SERVER_MAX_B64) {
+                setSharedStatus('Too large to sync via the server — turn on LAN only', '');
+                showToast('Text is too large to sync through the server. Use "LAN only" to share it directly.', 'error');
+                return;
+            }
             const rev = (state.clientId || 'me') + '-' + (++state.sharedText.revCounter);
             const count = Math.max(1, Math.ceil(b64.length / TS_CHUNK_SIZE));
 

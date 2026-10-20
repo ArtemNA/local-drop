@@ -107,8 +107,13 @@ const MAX_SIGNAL_SIZE = 100 * 1024; // 100KB
 // the signaling channel. This is exempt from the file-transfer heuristics below —
 // it's legitimate collaborative text, not a covert binary tunnel — but still capped.
 const MAX_TEXT_CHUNK = 512 * 1024;        // max size of a single chunk WS frame
-const MAX_TEXT_TOTAL = 60 * 1024 * 1024;  // max assembled (compressed+base64) snapshot ≈ maps to ~100MB+ of raw text
+const MAX_TEXT_TOTAL = 10 * 1024 * 1024;  // max assembled (compressed+base64) snapshot ≈ tens of MB of raw text
 const SNAP_CHUNK = 128 * 1024;            // chunk size when streaming a snapshot to a late joiner
+// Clients send 128KB chunks, so a full-size payload never needs more than this
+// many — bounds the reassembly array before anything is allocated.
+const MAX_TEXT_COUNT = Math.ceil(MAX_TEXT_TOTAL / (64 * 1024));
+const TEXT_ENCODINGS = new Set(['gzip', 'raw']);
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 
 const sharedTexts = new Map();  // channelKey -> { enc, language, data (base64), updatedAt }
 const pendingTexts = new Map(); // channelKey -> in-progress reassembly { rev, count, parts, received, bytes, enc, language }
@@ -145,22 +150,16 @@ function handleTextShare(clientInfo, message) {
     if (!key) return;
 
     const { rev, seq, count, enc, language, data } = message;
-    if (typeof rev !== 'string' || typeof seq !== 'number' ||
-        typeof count !== 'number' || typeof data !== 'string') return;
-    if (!Number.isInteger(count) || count < 1 || count > 1000000) return;
+    if (typeof rev !== 'string' || rev.length > 100 ||
+        typeof data !== 'string' || !TEXT_ENCODINGS.has(enc)) return;
+    if (!Number.isInteger(count) || count < 1 || count > MAX_TEXT_COUNT) return;
     if (!Number.isInteger(seq) || seq < 0 || seq >= count) return;
+    if (!BASE64_RE.test(data)) return;
 
     const lang = typeof language === 'string' ? language.slice(0, 30) : 'auto';
 
-    // 1) Relay this chunk live to everyone else on the channel (pass-through).
-    broadcastChannel(clientInfo, JSON.stringify({
-        type: 'text-update',
-        rev, seq, count, enc, language: lang, data,
-        fromId: clientInfo.id,
-        fromName: clientInfo.name
-    }));
-
-    // 2) Reassemble server-side for late joiners.
+    // 1) Account for the chunk first, so an oversized payload is neither stored
+    //    nor relayed.
     let pend = pendingTexts.get(key);
     if (!pend || pend.rev !== rev) {
         pend = {
@@ -171,20 +170,42 @@ function handleTextShare(clientInfo, message) {
             bytes: 0,
             enc,
             language: lang,
+            rejected: false,
             updatedAt: Date.now()
         };
         pendingTexts.set(key, pend);
     }
+    if (pend.rejected || pend.count !== count) return;
     pend.updatedAt = Date.now();
-    if (pend.parts[seq] === undefined) {
-        pend.parts[seq] = data;
-        pend.received++;
-        pend.bytes += data.length;
-        if (pend.bytes > MAX_TEXT_TOTAL) {
-            pendingTexts.delete(key); // too big — drop the snapshot (live relay already happened)
-            return;
+    if (pend.parts[seq] !== undefined) return; // duplicate chunk
+
+    if (pend.bytes + data.length > MAX_TEXT_TOTAL) {
+        // Too big — drop what we have and ignore the rest of this revision.
+        pend.rejected = true;
+        pend.parts = [];
+        pend.bytes = 0;
+        if (clientInfo.ws.readyState === 1) {
+            clientInfo.ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Shared text is too large to sync through the server. Turn on "LAN only" to share it directly.',
+                code: 'TEXT_TOO_LARGE'
+            }));
         }
+        return;
     }
+    pend.parts[seq] = data;
+    pend.received++;
+    pend.bytes += data.length;
+
+    // 2) Relay this chunk live to everyone else on the channel (pass-through).
+    broadcastChannel(clientInfo, JSON.stringify({
+        type: 'text-update',
+        rev, seq, count, enc, language: lang, data,
+        fromId: clientInfo.id,
+        fromName: clientInfo.name
+    }));
+
+    // 3) Once complete, keep the snapshot for late joiners.
     if (pend.received >= pend.count) {
         sharedTexts.set(key, {
             enc: pend.enc,
