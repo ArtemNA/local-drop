@@ -23,11 +23,11 @@ const state = {
         timer: null, revCounter: 0, lastSentSig: null, sending: false,
         incoming: new Map(),      // rev -> in-progress reassembly of server-relayed text
         lastChangeAt: 0,          // local clock time of the last local or remote change
-        lanOnly: false,           // LAN-only mode: sync over P2P data channels, never via the server
         updatedAt: 0,             // when the current text was last changed (by anyone)
         p2pIncoming: new Map(),   // peerId -> in-progress P2P reassembly
         p2pChain: Promise.resolve(), // serializes P2P sends so chunks of different revs never interleave
-        p2pLiveSeq: 0
+        p2pLiveSeq: 0,
+        lanOnlyContent: false     // current text came from a LAN-only peer — never send it via the server
     },
     peers: new Map(),
     connections: new Map(),
@@ -45,7 +45,11 @@ const state = {
     verifyInbox: new Map(),     // peerId -> verify messages that arrived before we were ready
     untrustedPeers: new Set(),  // peers whose codes didn't match — no automatic reconnect
     localIP: null,
-    peerLocality: new Map() // peerId -> 'verified' | 'confirmed' | 'blocked'
+    peerLocality: new Map(), // peerId -> 'verified' | 'unverified' | 'confirmed' | 'blocked'
+    localityChecks: new Map(), // peerId -> promise of the running locality check
+    // LAN only (default on): files and shared text go only to peers whose
+    // connection is verified local, and shared text never via the server
+    lanOnly: true
 };
 
 // Get local IP address using WebRTC
@@ -100,6 +104,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     loadDeviceName();
+    initLanOnly();
     initSharedText();
     setupVerifyDialog();
     // Every connection must use this device's long-lived certificate (see
@@ -297,7 +302,8 @@ function handleWebSocketMessage(event) {
             
         case 'peer-updated':
             if (state.peers.has(message.peer.id)) {
-                state.peers.set(message.peer.id, message.peer);
+                // Merge: the update only carries the name, keep e.g. sameNetwork
+                state.peers.set(message.peer.id, { ...state.peers.get(message.peer.id), ...message.peer });
                 updateDevicesList();
             }
             break;
@@ -423,7 +429,9 @@ async function createConnection(peerId, isInitiator = true) {
             state.peerReconnects.delete(peerId);
             showToast(`Connected to ${state.peers.get(peerId)?.name || 'device'}`, 'success');
             // Verify locality of the connection
-            verifyLocality(connection, peerId).then(() => onPeerRouteChecked(peerId));
+            const check = verifyLocality(connection, peerId);
+            state.localityChecks.set(peerId, check);
+            check.then(() => onPeerRouteChecked(peerId));
         }
     };
     
@@ -623,6 +631,20 @@ async function connectToPeer(peerId) {
 }
 
 // Locality verification
+//
+// Decides whether a peer connection really stays inside the local network:
+//   'verified'   — direct and local: private / link-local addresses, the same
+//                  IPv6 /64, or — when the browser hides the addresses — a
+//                  LAN-like round-trip time or the server seeing both devices
+//                  behind the same network
+//   'unverified' — anything else, e.g. NAT traversal across the internet or a
+//                  direct IPv6 connection between two different networks
+//   'blocked'    — goes through a TURN relay
+//   'confirmed'  — not verified, but the user chose to send anyway
+//                  (only possible with LAN only turned off)
+const LAN_RTT_MS = 10;          // typical LAN round trip is 1–5 ms
+const SAME_NETWORK_RTT_MS = 30; // with the server's hint, allow for Wi-Fi jitter
+
 function isPrivateIP(ip) {
     if (!ip) return false;
     // IPv4 private ranges
@@ -630,134 +652,159 @@ function isPrivateIP(ip) {
     if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;
     if (/^192\.168\./.test(ip)) return true;
     if (/^169\.254\./.test(ip)) return true; // link-local
-    // IPv6 private
-    if (/^fd[0-9a-f]{2}:/i.test(ip)) return true;
-    if (/^fe80:/i.test(ip)) return true; // link-local
+    if (/^127\./.test(ip) || ip === '::1') return true; // same machine
+    // IPv6 unique-local (fc00::/7) and link-local
+    if (/^f[cd][0-9a-f]{2}:/i.test(ip)) return true;
+    if (/^fe80:/i.test(ip)) return true;
     return false;
 }
 
-function getSubnet24(ip) {
-    if (!ip) return null;
-    const parts = ip.split('.');
-    if (parts.length === 4) return parts.slice(0, 3).join('.');
-    return null;
+function isIPv6(ip) {
+    return typeof ip === 'string' && ip.includes(':');
+}
+
+// "2001:db8::1" → first four groups as a string ("2001:db8:0:0"), i.e. the /64
+// network a home router hands out. Returns null for anything unparsable.
+function ipv6Prefix64(ip) {
+    const halves = ip.split('%')[0].toLowerCase().split('::');
+    if (halves.length > 2) return null;
+    const head = halves[0] ? halves[0].split(':') : [];
+    const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+    const missing = 8 - head.length - tail.length;
+    if (halves.length === 1 ? head.length !== 8 : missing < 0) return null;
+    const groups = [...head, ...new Array(halves.length === 2 ? missing : 0).fill('0'), ...tail];
+    if (!groups.every(g => /^[0-9a-f]{1,4}$/.test(g))) return null;
+    return groups.slice(0, 4).map(g => parseInt(g, 16).toString(16)).join(':');
+}
+
+// The candidate pair the connection actually uses, plus its round-trip time
+async function readSelectedRoute(connection) {
+    const stats = await connection.getStats();
+    let pair = null;
+    stats.forEach(report => {
+        if (report.type === 'transport' && report.selectedCandidatePairId) {
+            pair = stats.get(report.selectedCandidatePairId) || pair;
+        }
+    });
+    if (!pair) {
+        // Older browsers: fall back to the nominated succeeded pair
+        stats.forEach(report => {
+            if (report.type === 'candidate-pair' && report.state === 'succeeded' && (report.nominated || !pair)) {
+                pair = report;
+            }
+        });
+    }
+    if (!pair) return null;
+
+    const local = stats.get(pair.localCandidateId) || {};
+    const remote = stats.get(pair.remoteCandidateId) || {};
+    // Browsers hide local addresses (empty, or an mDNS "<uuid>.local" name)
+    const visible = ip => (ip && !ip.endsWith('.local')) ? ip : null;
+    return {
+        localType: local.candidateType,
+        remoteType: remote.candidateType,
+        localIP: visible(local.address || local.ip),
+        remoteIP: visible(remote.address || remote.ip),
+        rttMs: typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime * 1000 : null
+    };
+}
+
+function classifyRoute(route, rttMs, sameNetwork) {
+    if (!route) return 'unverified';
+    const { localType, remoteType, localIP, remoteIP } = route;
+
+    if (localType === 'relay' || remoteType === 'relay') return 'blocked';
+
+    // srflx = the path was punched through a NAT from outside → another network.
+    // prflx shows up on LANs too (it's how mDNS-hidden peers get learned).
+    const direct = ['host', 'prflx'].includes(localType) && ['host', 'prflx'].includes(remoteType);
+    if (!direct) return 'unverified';
+
+    if (localIP && remoteIP) {
+        if (isPrivateIP(localIP) && isPrivateIP(remoteIP)) return 'verified';
+        if (isIPv6(localIP) && isIPv6(remoteIP)) {
+            const prefix = ipv6Prefix64(localIP);
+            if (prefix && prefix === ipv6Prefix64(remoteIP)) return 'verified';
+        }
+        return 'unverified'; // public addresses of different networks
+    }
+
+    // Addresses hidden by the browser: a direct path alone could still be IPv6
+    // across the internet, so also require LAN-like latency or the server's hint
+    if (rttMs !== null && rttMs <= LAN_RTT_MS) return 'verified';
+    if (sameNetwork && (rttMs === null || rttMs <= SAME_NETWORK_RTT_MS)) return 'verified';
+    return 'unverified';
 }
 
 async function verifyLocality(connection, peerId) {
+    let locality = 'unverified';
+    let route = null;
+    let bestRtt = null;
     try {
-        const stats = await connection.getStats();
-        let localCandidateType = null;
-        let remoteCandidateType = null;
-        let localIP = null;
-        let remoteIP = null;
-        let selectedPairFound = false;
-
-        stats.forEach(report => {
-            if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
-                selectedPairFound = true;
-                // Find local and remote candidates
-                stats.forEach(r => {
-                    if (r.id === report.localCandidateId) {
-                        localCandidateType = r.candidateType;
-                        localIP = r.address || r.ip;
-                    }
-                    if (r.id === report.remoteCandidateId) {
-                        remoteCandidateType = r.candidateType;
-                        remoteIP = r.address || r.ip;
-                    }
-                });
-            }
-        });
-
-        if (!selectedPairFound) {
-            // Fallback: check all succeeded pairs
-            stats.forEach(report => {
-                if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                    stats.forEach(r => {
-                        if (r.id === report.localCandidateId) {
-                            localCandidateType = r.candidateType;
-                            localIP = r.address || r.ip;
-                        }
-                        if (r.id === report.remoteCandidateId) {
-                            remoteCandidateType = r.candidateType;
-                            remoteIP = r.address || r.ip;
-                        }
-                    });
+        // A few samples: the first RTT measurement is often missing or noisy
+        for (let i = 0; i < 6; i++) {
+            const sample = await readSelectedRoute(connection);
+            if (sample) {
+                route = sample;
+                if (sample.rttMs !== null) {
+                    bestRtt = bestRtt === null ? sample.rttMs : Math.min(bestRtt, sample.rttMs);
                 }
-            });
-        }
-
-        console.log(`Locality check for ${peerId}: local=${localCandidateType}(${localIP}), remote=${remoteCandidateType}(${remoteIP})`);
-
-        // Check for relay - block
-        if (localCandidateType === 'relay' || remoteCandidateType === 'relay') {
-            state.peerLocality.set(peerId, 'blocked');
-            showToast('Connection uses relay - file transfer blocked (not local)', 'error');
-            updateDevicesList();
-            return;
-        }
-
-        // Check for verified local: both host candidates with private IPs
-        if (localCandidateType === 'host' && remoteCandidateType === 'host') {
-            // If IPs are available and private, verified
-            if (localIP && remoteIP && isPrivateIP(localIP) && isPrivateIP(remoteIP)) {
-                state.peerLocality.set(peerId, 'verified');
-                updateDevicesList();
-                return;
             }
-            // If IPs are empty/unavailable (browser privacy), host+host with no relay = direct local
-            if (!localIP && !remoteIP) {
-                state.peerLocality.set(peerId, 'verified');
-                updateDevicesList();
-                return;
-            }
+            if (route && bestRtt !== null && i >= 2) break;
+            await new Promise(resolve => setTimeout(resolve, 250));
         }
-
-        // Additional check: same subnet via localIP hints
-        if (state.localIP && localIP && remoteIP && isPrivateIP(localIP) && isPrivateIP(remoteIP)) {
-            const localSubnet = getSubnet24(localIP);
-            const remoteSubnet = getSubnet24(remoteIP);
-            if (localSubnet && remoteSubnet && localSubnet === remoteSubnet) {
-                state.peerLocality.set(peerId, 'verified');
-                updateDevicesList();
-                return;
-            }
-        }
-
-        // Unverified direct route - will need user confirmation before transfer
-        state.peerLocality.set(peerId, 'unverified');
-        updateDevicesList();
-
+        const sameNetwork = state.peers.get(peerId)?.sameNetwork === true;
+        locality = classifyRoute(route, bestRtt, sameNetwork);
+        console.log(`Locality check for ${peerId}: ${locality} — local=${route?.localType}(${route?.localIP || 'hidden'}), ` +
+            `remote=${route?.remoteType}(${route?.remoteIP || 'hidden'}), rtt=${bestRtt === null ? '?' : bestRtt.toFixed(1) + 'ms'}, sameNetwork=${sameNetwork}`);
     } catch (err) {
         console.error('Error verifying locality:', err);
-        // On error, mark as unverified rather than blocking
-        state.peerLocality.set(peerId, 'unverified');
-        updateDevicesList();
     }
+
+    if (state.connections.get(peerId) !== connection) return; // replaced meanwhile
+    state.peerLocality.set(peerId, locality);
+    if (locality === 'blocked') {
+        showToast('Connection uses a relay server — transfers blocked (not local)', 'error');
+    }
+    updateDevicesList();
+}
+
+// Wait for the running locality check of a peer, if any
+async function localityOf(peerId) {
+    try {
+        await state.localityChecks.get(peerId);
+    } catch (_) { /* recorded as unverified */ }
+    return state.peerLocality.get(peerId);
 }
 
 async function checkLocalityBeforeTransfer(peerId) {
-    const locality = state.peerLocality.get(peerId);
-
-    if (locality === 'verified' || locality === 'confirmed') {
-        return true;
-    }
+    const locality = await localityOf(peerId);
+    const peerName = state.peers.get(peerId)?.name || 'device';
 
     if (locality === 'blocked') {
         showToast('Transfer blocked: connection route is not local (relay detected)', 'error');
         return false;
     }
 
+    if (state.lanOnly) {
+        if (locality === 'verified') return true;
+        showToast(`${peerName} is not verified to be on your local network. Turn off "LAN only" to send over the internet.`, 'warning');
+        return false;
+    }
+
+    if (locality === 'verified' || locality === 'confirmed') {
+        return true;
+    }
+
     // Unverified or unknown - ask user
     return new Promise(resolve => {
-        const peerName = state.peers.get(peerId)?.name || 'device';
         const dialog = document.createElement('div');
         dialog.className = 'locality-dialog';
         dialog.innerHTML = `
             <div class="locality-dialog-overlay"></div>
             <div class="locality-dialog-content">
-                <h3>Unverified Route</h3>
-                <p>The connection to <strong>${escapeHtml(peerName)}</strong> could not be verified as local. If you are sure both devices are on the same network, you can proceed.</p>
+                <h3>Not a local connection</h3>
+                <p>The connection to <strong>${escapeHtml(peerName)}</strong> could not be verified as local, so the file may travel over the internet (still encrypted, directly between the devices). Send anyway?</p>
                 <div class="locality-dialog-actions">
                     <button class="locality-btn-cancel">Cancel</button>
                     <button class="locality-btn-confirm">Transfer Anyway</button>
@@ -774,7 +821,6 @@ async function checkLocalityBeforeTransfer(peerId) {
         dialog.querySelector('.locality-btn-confirm').onclick = () => {
             state.peerLocality.set(peerId, 'confirmed');
             updateDevicesList();
-            onPeerRouteChecked(peerId);
             dialog.remove();
             resolve(true);
         };
@@ -783,6 +829,19 @@ async function checkLocalityBeforeTransfer(peerId) {
             resolve(false);
         };
     });
+}
+
+// Receiver side of LAN only: refuse a file from a peer whose route isn't local
+async function enforceLanForIncoming(transfer) {
+    const locality = await localityOf(transfer.peerId);
+    if (!state.lanOnly || locality === 'verified') return;
+    if (transfer.status !== 'receiving' && transfer.status !== 'paused') return;
+
+    transfer.status = 'cancelled';
+    notifyPeer(transfer, 'transfer-cancel', { reason: 'lan-only' });
+    stopTransferLocally(transfer);
+    updateTransferUI(transfer);
+    showToast(`Blocked ${transfer.fileName}: ${state.peers.get(transfer.peerId)?.name || 'the sender'} is not verified to be on your local network (LAN only)`, 'warning');
 }
 
 // ─────────────────────────────────────────────
@@ -1160,9 +1219,9 @@ async function sendFiles(peerId, files) {
     }
 
     // Locality check after connection is established (verifyLocality runs on 'connected')
+    // Explains itself (toast) or asks the user — nothing more to say on refusal
     const localityOk = await checkLocalityBeforeTransfer(peerId);
     if (!localityOk) {
-        showToast('Transfer cancelled: route not verified as local', 'warning');
         return;
     }
 
@@ -1497,6 +1556,11 @@ function handleFileStart(message, peerId) {
 
     showToast(`Receiving ${message.name} from ${state.peers.get(peerId)?.name || 'device'}`, 'info');
 
+    // LAN only: refuse it if the sender's route turns out not to be local
+    if (state.lanOnly) {
+        enforceLanForIncoming(transfer);
+    }
+
     // Saving straight to disk needs a click (browsers only open the save
     // dialog on a user gesture), so offer a button; meanwhile chunks collect in memory.
     if (canSaveToDisk) {
@@ -1698,10 +1762,10 @@ function handleTransferResumeRequest(message, peerId) {
     }
 }
 
-function notifyPeer(transfer, type) {
+function notifyPeer(transfer, type, extra = {}) {
     const dataChannel = state.dataChannels.get(transfer.peerId);
     if (dataChannel && dataChannel.readyState === 'open') {
-        dataChannel.send(JSON.stringify({ type, transferId: transfer.id }));
+        dataChannel.send(JSON.stringify({ ...extra, type, transferId: transfer.id }));
     }
 }
 
@@ -1788,7 +1852,10 @@ function handleTransferCancel(message, peerId) {
         transfer.status = 'cancelled';
         stopTransferLocally(transfer);
         updateTransferUI(transfer);
-        showToast(`Transfer cancelled by ${state.peers.get(peerId)?.name || 'device'}`, 'warning');
+        const peerName = state.peers.get(peerId)?.name || 'device';
+        showToast(message.reason === 'lan-only'
+            ? `${peerName} only accepts files over the local network (LAN only)`
+            : `Transfer cancelled by ${peerName}`, 'warning');
     }
 }
 
@@ -1814,6 +1881,7 @@ function handlePeerDisconnect(peerId) {
     state.peerIdentity.delete(peerId);
     state.verifyInbox.delete(peerId);
     state.untrustedPeers.delete(peerId);
+    state.localityChecks.delete(peerId);
     state.sharedText.p2pIncoming.delete(peerId);
 
     // Close connection
@@ -1916,11 +1984,19 @@ function updateDevicesList() {
             localityIndicator = '<span class="locality-badge confirmed" title="User confirmed local">&#x26a0;</span>';
         } else if (isConnected && locality === 'blocked') {
             localityIndicator = '<span class="locality-badge blocked" title="Relay detected - blocked">&#x1f6ab;</span>';
+        } else if (isConnected && locality === 'unverified') {
+            localityIndicator = '<span class="locality-badge remote" title="Not verified to be on your local network">&#x1f310;</span>';
         }
+
+        // With LAN only on, only verified-local peers can be sent to
+        const lanBlocked = isConnected && state.lanOnly && locality !== undefined &&
+            locality !== 'verified';
 
         let statusText = 'Click to connect';
         if (isConnected && locality === 'blocked') {
             statusText = 'Blocked (not local)';
+        } else if (lanBlocked) {
+            statusText = 'Not on your local network';
         } else if (isConnected) {
             statusText = 'Click to send files';
         } else if (state.untrustedPeers.has(peerId)) {
@@ -1961,6 +2037,8 @@ function updateDevicesList() {
                     state.untrustedPeers.delete(peerId);
                 }
                 connectToPeer(peerId);
+            } else if (lanBlocked) {
+                showToast(`${peer.name} is not verified to be on your local network. Turn off "LAN only" to send over the internet.`, 'warning');
             } else {
                 // Show file selection dialog for connected device
                 openFilePicker(peerId);
@@ -2465,15 +2543,10 @@ function initSharedText() {
 
     if (!ts.fab || !ts.modal || !ts.textarea) return;
 
-    // LAN-only is a per-device preference, on by default (keeping data inside
-    // the local network is the point of the app); an explicit choice is kept
-    state.sharedText.lanOnly = true;
-    try {
-        state.sharedText.lanOnly = localStorage.getItem('sharedTextLanOnly') !== '0';
-    } catch (_) { /* storage unavailable — keep the default */ }
+    // Same switch as in the header (see initLanOnly)
     if (ts.lanToggle) {
-        ts.lanToggle.checked = state.sharedText.lanOnly;
-        ts.lanToggle.addEventListener('change', () => setLanOnlyText(ts.lanToggle.checked));
+        ts.lanToggle.checked = state.lanOnly;
+        ts.lanToggle.addEventListener('change', () => setLanOnly(ts.lanToggle.checked));
     }
     updateSharedHint();
 
@@ -2536,8 +2609,14 @@ function isSharedChannelReady() {
     return state.localMode || state.inRoom;
 }
 
+// Text goes peer-to-peer only: LAN only is on, or the current text came from a
+// device that keeps it on the local network
+function textStaysLocal() {
+    return state.lanOnly || state.sharedText.lanOnlyContent;
+}
+
 function updateSharedStatus(force) {
-    if (state.sharedText.lanOnly) {
+    if (textStaysLocal()) {
         const { ready } = getLanTextTargets();
         if (ready.length > 0) {
             setSharedStatus(`LAN only · ${ready.length} local device${ready.length > 1 ? 's' : ''}`, 'synced');
@@ -2553,26 +2632,49 @@ function updateSharedStatus(force) {
 
 function updateSharedHint() {
     if (!ts.hint) return;
-    ts.hint.textContent = state.sharedText.lanOnly
-        ? 'LAN only: text goes directly device-to-device over the encrypted P2P connection and never through the server. Only devices verified to be on your local network receive it.'
+    ts.hint.textContent = state.lanOnly
+        ? 'LAN only: text goes directly device-to-device over the encrypted P2P connection and never through the server. Only devices verified to be on your local network receive it (files too).'
+        : state.sharedText.lanOnlyContent
+        ? 'This text was shared on the local network only, so it stays there: it goes only to verified local devices, not through the server. Clear it to sync through the server again.'
         : 'Types live to every device in this room. Formatting is preserved — paste code, copy it back byte-for-byte anywhere.';
 }
 
 // ── LAN-only mode ──
-// Shared text travels over the same WebRTC data channel as files instead of the
-// server relay, and only to peers whose route was verified local (or confirmed
-// by the user). Receiving still works from both paths.
-function setLanOnlyText(on) {
-    const st = state.sharedText;
-    st.lanOnly = !!on;
+// One switch for the whole app (header and shared-text dialog):
+// - files are only sent to / accepted from peers whose route is verified local
+//   (no "Transfer Anyway");
+// - shared text travels over the WebRTC data channel instead of the server
+//   relay, and only to verified-local peers. Receiving works from both paths.
+// A per-device preference, on by default (keeping data inside the local
+// network is the point of the app); an explicit choice is kept. The storage
+// key predates files being covered, hence the name.
+const LAN_ONLY_KEY = 'sharedTextLanOnly';
+
+function initLanOnly() {
     try {
-        localStorage.setItem('sharedTextLanOnly', st.lanOnly ? '1' : '0');
+        state.lanOnly = localStorage.getItem(LAN_ONLY_KEY) !== '0';
+    } catch (_) { /* storage unavailable — keep the default */ }
+
+    const headerToggle = document.getElementById('lanOnlyToggle');
+    if (headerToggle) {
+        headerToggle.checked = state.lanOnly;
+        headerToggle.addEventListener('change', () => setLanOnly(headerToggle.checked));
+    }
+}
+
+function setLanOnly(on) {
+    state.lanOnly = !!on;
+    try {
+        localStorage.setItem(LAN_ONLY_KEY, state.lanOnly ? '1' : '0');
     } catch (_) { /* not persisted — fine */ }
-    if (ts.lanToggle) ts.lanToggle.checked = st.lanOnly;
+    const headerToggle = document.getElementById('lanOnlyToggle');
+    if (headerToggle) headerToggle.checked = state.lanOnly;
+    if (ts.lanToggle) ts.lanToggle.checked = state.lanOnly;
     updateSharedHint();
     updateSharedStatus(true);
+    updateDevicesList();
 
-    if (st.lanOnly) {
+    if (state.lanOnly) {
         connectPeersForLanText();
         // Push the current text to peers that are already reachable locally
         if (ts.textarea && ts.textarea.value) {
@@ -2588,7 +2690,8 @@ function getLanTextTargets() {
     state.peers.forEach((_, peerId) => {
         const dc = state.dataChannels.get(peerId);
         const locality = state.peerLocality.get(peerId);
-        if (dc && dc.readyState === 'open' && (locality === 'verified' || locality === 'confirmed')) {
+        // 'confirmed' (send anyway) only exists with LAN only off — it doesn't count here
+        if (dc && dc.readyState === 'open' && locality === 'verified') {
             ready.push(peerId);
         } else {
             skipped++;
@@ -2600,7 +2703,7 @@ function getLanTextTargets() {
 // In LAN-only mode every peer needs a data channel, so connect to them all
 // instead of waiting for the user to click each device.
 function connectPeersForLanText() {
-    if (!state.sharedText.lanOnly) return;
+    if (!state.lanOnly) return;
     state.peers.forEach((_, peerId) => {
         if (state.untrustedPeers.has(peerId)) return;
         const conn = state.connections.get(peerId);
@@ -2612,7 +2715,7 @@ function connectPeersForLanText() {
 // Called when a peer's route gets classified and when its data channel opens —
 // these happen in either order, so catch-up is sent once both are done.
 function onPeerRouteChecked(peerId) {
-    if (!state.sharedText.lanOnly || !ts.textarea) return;
+    if (!state.lanOnly || !ts.textarea) return;
     updateSharedStatus(true);
 
     const dc = state.dataChannels.get(peerId);
@@ -2699,24 +2802,29 @@ function handleP2PTextChunk(message, peerId) {
     const peerName = state.peers.get(peerId)?.name || 'device';
     const theirTime = typeof message.updatedAt === 'number' ? message.updatedAt : 0;
 
-    decodeSharedText(inc.parts.join(''), message.enc).then(text => {
+    decodeSharedText(inc.parts.join(''), message.enc).then(async text => {
+        // With LAN only on, accept text only over a verified local route
+        if (state.lanOnly && await localityOf(peerId) !== 'verified') return;
+
         if (message.kind === 'hello' && ts.textarea.value && ts.textarea.value !== text) {
             // Catch-up from a peer: keep whichever text is newer. If ours is
             // newer, answer with it so both sides converge.
             if (theirTime < st.updatedAt) {
-                if (st.lanOnly) sendSharedTextP2P('hello', [peerId]);
+                if (state.lanOnly) sendSharedTextP2P('hello', [peerId]);
                 return;
             }
             if (theirTime === st.updatedAt) return;
         }
 
-        // The sender keeps this text inside the LAN — follow suit, otherwise our
-        // next edit would carry it to the server.
-        if (!st.lanOnly) {
-            setLanOnlyText(true);
-            showToast(`Shared text switched to LAN only (${peerName} shares it only on the local network)`, 'info');
+        // The sender keeps this text inside the LAN — keep it there too, otherwise
+        // our next edit would carry it to the server (until it's cleared or
+        // replaced by text that came through the server)
+        applyRemoteText(text, message.language, peerName, theirTime || Date.now(), 'local network');
+        if (!state.lanOnly && !st.lanOnlyContent) {
+            showToast(`${peerName} shares this text only on the local network — it won't be synced through the server`, 'info');
         }
-        applyRemoteText(text, message.language, peerName, theirTime || Date.now());
+        st.lanOnlyContent = true;
+        updateSharedHint();
     }).catch(err => {
         console.error('Shared text P2P decode failed:', err);
     });
@@ -2832,7 +2940,7 @@ function sendSharedText(immediate) {
 
     const doSend = async () => {
         state.sharedText.timer = null;
-        const lanOnly = state.sharedText.lanOnly;
+        const lanOnly = textStaysLocal();
         if (!lanOnly && (!state.ws || state.ws.readyState !== WebSocket.OPEN)) return;
 
         const text = ts.textarea.value;
@@ -2951,7 +3059,12 @@ function handleTextUpdateChunk(message) {
     decodeSharedText(b64, inc.enc).then(text => {
         // A join snapshot is older than any edit made while it was streaming
         if (rev.startsWith('snap-') && st.lastChangeAt > inc.startedAt) return;
-        applyRemoteText(text, inc.language, inc.fromName);
+        applyRemoteText(text, inc.language, inc.fromName, undefined, 'server');
+        // Text that came through the server is not LAN-only content
+        if (st.lanOnlyContent) {
+            st.lanOnlyContent = false;
+            updateSharedHint();
+        }
     }).catch(err => {
         console.error('Shared text decode failed:', err);
     });
@@ -2959,7 +3072,9 @@ function handleTextUpdateChunk(message) {
 
 // Apply fully-assembled remote text without echoing it back. Programmatic
 // .value assignment does not fire 'input', so no re-send loop occurs.
-function applyRemoteText(text, language, fromName, updatedAt) {
+// `via` says which path the text took ('server' or 'local network') — shown in
+// the status so it's clear whether LAN only actually applied
+function applyRemoteText(text, language, fromName, updatedAt, via) {
     if (!ts.textarea || typeof text !== 'string') return;
     state.sharedText.updatedAt = updatedAt || Date.now();
     state.sharedText.lastChangeAt = Date.now();
@@ -2985,7 +3100,7 @@ function applyRemoteText(text, language, fromName, updatedAt) {
     syncSharedScroll();
 
     if (fromName) {
-        setSharedStatus('Updated by ' + fromName, 'remote');
+        setSharedStatus('Updated by ' + fromName + (via ? ' · via ' + via : ''), 'remote');
         if (ts.modal.classList.contains('hidden')) {
             ts.fab.classList.add('has-activity');
         }
@@ -3015,6 +3130,9 @@ function clearSharedText() {
     renderSharedHighlight();
     syncSharedScroll();
     sendSharedText(true); // clears for everyone on the channel
+    // Nothing LAN-only left to protect
+    state.sharedText.lanOnlyContent = false;
+    updateSharedHint();
     showToast(isSharedChannelReady() ? 'Cleared for everyone' : 'Cleared', 'info');
     ts.textarea.focus();
 }

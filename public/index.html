@@ -29,6 +29,11 @@
                             </svg>
                         </button>
                     </div>
+                    <label class="ts-lan-toggle header-lan-toggle" title="Files and shared text go only to devices verified to be on your local network. Turn off to also send over the internet (still encrypted, device to device).">
+                        <input type="checkbox" id="lanOnlyToggle" checked>
+                        <span class="ts-lan-slider" aria-hidden="true"></span>
+                        <span class="ts-lan-label">LAN only</span>
+                    </label>
                     <button id="deviceNameBtn" class="device-name-btn">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
@@ -141,7 +146,7 @@
             <div class="ts-header">
                 <h3>📝 Shared Text</h3>
                 <div class="ts-controls">
-                    <label class="ts-lan-toggle" title="Send shared text only directly between devices on your local network (peer-to-peer), never through the server">
+                    <label class="ts-lan-toggle" title="Same switch as in the header: files and text only to devices verified to be on your local network; text never through the server">
                         <input type="checkbox" id="tsLanOnly">
                         <span class="ts-lan-slider" aria-hidden="true"></span>
                         <span class="ts-lan-label">LAN only</span>
