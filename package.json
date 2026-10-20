@@ -1,6 +1,6 @@
 {
   "name": "local-file-transfer",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "Local P2P file transfer app using WebRTC",
   "main": "server.js",
   "scripts": {

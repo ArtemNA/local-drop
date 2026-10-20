@@ -17,7 +17,9 @@ A completely local file transfer application that allows secure P2P file sharing
 - **🖼️ Image Preview**: Preview images before sending
 - **📊 Progress Tracking**: Real-time progress bars with speed indicators
 - **⏸️ Pause & Resume**: Pause from either device; transfers continue automatically after a brief connection drop
-- **📝 Shared Text**: Live shared clipboard with syntax highlighting. By default (**LAN only**) it goes directly between devices on your local network and never through the server
+- **🏠 LAN only** (default): Files and shared text go only to devices verified to be on your local network
+- **📝 Shared Text**: Live shared clipboard with syntax highlighting. With LAN only it goes directly between devices and never through the server
+- **🔑 Verify**: Compare a 6-digit code on both devices to rule out a man-in-the-middle
 - **💾 Large Files**: Very large files can be streamed straight to disk ("Save to disk") in supported browsers
 - **📦 Queue System**: Send multiple files in a queue
 - **🔌 Auto-Reconnection**: Automatically reconnects if connection is lost
@@ -175,10 +177,23 @@ both screens means a direct connection — press **Codes match** on each device.
 - This protects the connection itself. It can't protect against a server that
   serves modified app code — for that, run the server yourself (local mode).
 
+### LAN only (default)
+One switch at the top of the page. When on, files and shared text go only to
+(and are only accepted from) devices whose connection is verified as local.
+Turn it off to also send over the internet — still encrypted and directly
+between the devices.
+
+A connection counts as local when the route WebRTC actually uses is direct
+(no NAT traversal, no relay) and either both addresses are private /
+link-local, both are in the same IPv6 /64, or — if the browser hides the
+addresses — the round-trip time is LAN-like (≤ 10 ms) or the server saw both
+devices behind the same network and the RTT is ≤ 30 ms.
+
 ### Shared Text
 - **LAN only** (default): text travels over the same encrypted peer-to-peer
   connection as files, only to devices whose connection is verified as local.
-  The server never sees it.
+  The server never sees it. Text received this way is never relayed through
+  the server, even from a device with LAN only off.
 - With **LAN only** off, text is relayed through the server so it also works
   between different networks. The server keeps the latest text in memory for
   devices that join later (until the room empties); it is protected in transit
