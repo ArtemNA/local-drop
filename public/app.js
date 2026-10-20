@@ -693,7 +693,7 @@ async function checkLocalityBeforeTransfer(peerId) {
             <div class="locality-dialog-overlay"></div>
             <div class="locality-dialog-content">
                 <h3>Unverified Route</h3>
-                <p>The connection to <strong>${peerName}</strong> could not be verified as local. If you are sure both devices are on the same network, you can proceed.</p>
+                <p>The connection to <strong>${escapeHtml(peerName)}</strong> could not be verified as local. If you are sure both devices are on the same network, you can proceed.</p>
                 <div class="locality-dialog-actions">
                     <button class="locality-btn-cancel">Cancel</button>
                     <button class="locality-btn-confirm">Transfer Anyway</button>
@@ -1019,6 +1019,14 @@ function handleBinaryData(data, peerId) {
 
 // Handle incoming file start
 function handleFileStart(message, peerId) {
+    // The id ends up in element ids, selectors and onclick handlers — only
+    // accept the shape our own generateTransferId() produces.
+    if (typeof message.transferId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(message.transferId) ||
+        typeof message.name !== 'string' || !Number.isFinite(message.size) || message.size < 0) {
+        console.warn('Ignoring malformed file-start from', peerId);
+        return;
+    }
+
     const transfer = {
         id: message.transferId,
         peerId: peerId,
@@ -1329,7 +1337,7 @@ function updateDevicesList() {
                     <line x1="12" y1="18" x2="12" y2="18"></line>
                 </svg>
             </div>
-            <div class="device-name">${peer.name} ${localityIndicator}</div>
+            <div class="device-name">${escapeHtml(peer.name)} ${localityIndicator}</div>
             <div class="device-status">${statusText}</div>
         `;
         
@@ -1399,7 +1407,7 @@ function handleFileSelection(files, peerId) {
         const info = document.createElement('div');
         info.className = 'file-info';
         info.innerHTML = `
-            <div class="file-name">${file.name}</div>
+            <div class="file-name">${escapeHtml(file.name)}</div>
             <div class="file-size">${formatFileSize(file.size)}</div>
         `;
         preview.appendChild(info);
@@ -1443,9 +1451,9 @@ function addTransferToUI(transfer) {
     transferItem.innerHTML = `
         <div class="transfer-header">
             <div class="transfer-info">
-                <div class="transfer-filename">${fileName}</div>
+                <div class="transfer-filename">${escapeHtml(fileName)}</div>
                 <div class="transfer-details">
-                    ${transfer.direction === 'send' ? 'To' : 'From'} ${peerName} • ${formatFileSize(fileSize)}
+                    ${transfer.direction === 'send' ? 'To' : 'From'} ${escapeHtml(peerName)} • ${formatFileSize(fileSize)}
                 </div>
                 <div class="transfer-speed" id="speed-${transfer.id}"></div>
             </div>
@@ -2096,8 +2104,12 @@ function setSharedStatus(text, cls) {
     ts.status.className = 'ts-status' + (cls ? ' ' + cls : '');
 }
 
+// Escape for HTML text and attribute values. Use for anything that comes from
+// another device (names, file names) before putting it into innerHTML.
 function escapeHtml(str) {
-    return str.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+    return String(str).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
 }
 
 // Above this many characters we stop syntax-highlighting (highlighting megabytes
