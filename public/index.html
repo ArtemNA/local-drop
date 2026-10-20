@@ -141,6 +141,11 @@
             <div class="ts-header">
                 <h3>📝 Shared Text</h3>
                 <div class="ts-controls">
+                    <label class="ts-lan-toggle" title="Send shared text only directly between devices on your local network (peer-to-peer), never through the server">
+                        <input type="checkbox" id="tsLanOnly">
+                        <span class="ts-lan-slider" aria-hidden="true"></span>
+                        <span class="ts-lan-label">LAN only</span>
+                    </label>
                     <select id="tsLanguage" class="ts-select" title="Syntax highlighting">
                         <option value="auto">Auto-detect</option>
                         <option value="plaintext">Plain text</option>
@@ -163,7 +168,7 @@
                     </button>
                 </div>
             </div>
-            <p class="ts-hint">Types live to every device in this room. Formatting is preserved — paste code, copy it back byte-for-byte anywhere.</p>
+            <p class="ts-hint" id="tsHint">Types live to every device in this room. Formatting is preserved — paste code, copy it back byte-for-byte anywhere.</p>
             <div class="ts-editor" id="tsEditor">
                 <pre class="ts-highlight" aria-hidden="true"><code id="tsHighlight" class="hljs"></code></pre>
                 <textarea id="tsTextarea" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="soft" placeholder="Paste or type text / code here…"></textarea>
@@ -199,7 +204,7 @@
     <!-- Toast Container -->
     <div id="toastContainer" class="toast-container"></div>
 
-    <footer class="app-version" id="appVersion">v2.1.0</footer>
+    <footer class="app-version" id="appVersion"><a href="changelog.html" id="appVersionLink" title="What's new">v2.2.0</a><span id="appDeploy"></span></footer>
 
     <!-- Syntax highlighting (optional — editor degrades to plain text if it fails to load, e.g. offline LAN) -->
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>

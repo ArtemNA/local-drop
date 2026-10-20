@@ -20,7 +20,14 @@ const state = {
     roomCode: null,
     inRoom: false,
     localMode: false,
-    sharedText: { timer: null, revCounter: 0, lastSentSig: null, incoming: null, sending: false },
+    sharedText: {
+        timer: null, revCounter: 0, lastSentSig: null, incoming: null, sending: false,
+        lanOnly: false,           // LAN-only mode: sync over P2P data channels, never via the server
+        updatedAt: 0,             // when the current text was last changed (by anyone)
+        p2pIncoming: new Map(),   // peerId -> in-progress P2P reassembly
+        p2pChain: Promise.resolve(), // serializes P2P sends so chunks of different revs never interleave
+        p2pLiveSeq: 0
+    },
     peers: new Map(),
     connections: new Map(),
     dataChannels: new Map(),
@@ -206,11 +213,12 @@ function handleWebSocketMessage(event) {
                 message.peers.forEach(peer => {
                     state.peers.set(peer.id, peer);
                 });
-                
+
                 // Hide room section, show devices
                 document.getElementById('roomSection').style.display = 'none';
                 document.getElementById('devicesList').parentElement.style.display = 'block';
                 updateDevicesList();
+                connectPeersForLanText();
             } else if (message.needsRoom) {
                 // Need to select/create room
                 showRoomSection();
@@ -239,17 +247,21 @@ function handleWebSocketMessage(event) {
                 document.getElementById('deviceName').textContent = message.deviceName;
             }
             
+            if (message.clientId) {
+                state.clientId = message.clientId;
+            }
             state.roomCode = message.roomCode;
             state.inRoom = true;
-            
+
             // Add existing peers in room
             message.peers.forEach(peer => {
                 state.peers.set(peer.id, peer);
             });
-            
+
             hideRoomSection();
             showRoomInfo(message.roomCode);
             updateDevicesList();
+            connectPeersForLanText();
 
             // Update URL with room code
             const url = new URL(window.location);
@@ -267,6 +279,7 @@ function handleWebSocketMessage(event) {
             state.peers.set(message.peer.id, message.peer);
             updateDevicesList();
             showToast(`${message.peer.name} joined`, 'info');
+            connectPeersForLanText();
             break;
             
         case 'peer-left':
@@ -320,6 +333,9 @@ function handleWebSocketMessage(event) {
 
 // Handle room created
 function handleRoomCreated(message) {
+    if (message.clientId) {
+        state.clientId = message.clientId;
+    }
     state.roomCode = message.roomCode;
     state.inRoom = true;
     
@@ -390,7 +406,7 @@ async function createConnection(peerId, isInitiator = true) {
         } else if (connection.connectionState === 'connected') {
             showToast(`Connected to ${state.peers.get(peerId)?.name || 'device'}`, 'success');
             // Verify locality of the connection
-            verifyLocality(connection, peerId);
+            verifyLocality(connection, peerId).then(() => onPeerRouteChecked(peerId));
         }
     };
     
@@ -422,6 +438,7 @@ function setupDataChannel(dataChannel, peerId) {
     dataChannel.onopen = () => {
         console.log(`Data channel opened with ${peerId}`);
         updateDevicesList();
+        onPeerRouteChecked(peerId);
         
         // Resume any pending transfers
         const pendingTransfer = state.activeTransfers.get(peerId);
@@ -432,7 +449,11 @@ function setupDataChannel(dataChannel, peerId) {
     
     dataChannel.onclose = () => {
         console.log(`Data channel closed with ${peerId}`);
-        state.dataChannels.delete(peerId);
+        // A replaced connection's old channel may close after the new one is
+        // registered — only forget the channel if it is still the current one.
+        if (state.dataChannels.get(peerId) === dataChannel) {
+            state.dataChannels.delete(peerId);
+        }
         updateDevicesList();
     };
     
@@ -449,7 +470,18 @@ function setupDataChannel(dataChannel, peerId) {
 // Handle offer
 async function handleOffer(message) {
     const { fromId, offer } = message;
-    
+
+    // Both sides sent an offer at the same time (e.g. both have LAN-only shared
+    // text on). The side with the smaller id keeps its own offer; the other drops
+    // its own connection and answers instead.
+    const existing = state.connections.get(fromId);
+    if (existing && existing.signalingState === 'have-local-offer') {
+        if (state.clientId && state.clientId < fromId) {
+            return;
+        }
+        existing.close();
+    }
+
     try {
         const connection = await createConnection(fromId, false);
         await connection.setRemoteDescription(new RTCSessionDescription(offer));
@@ -678,6 +710,7 @@ async function checkLocalityBeforeTransfer(peerId) {
         dialog.querySelector('.locality-btn-confirm').onclick = () => {
             state.peerLocality.set(peerId, 'confirmed');
             updateDevicesList();
+            onPeerRouteChecked(peerId);
             dialog.remove();
             resolve(true);
         };
@@ -892,10 +925,10 @@ async function sendWithFlowControl(dataChannel, data) {
     while (dataChannel.bufferedAmount > CONFIG.bufferThreshold) {
         await new Promise(resolve => {
             dataChannel.bufferedAmountLowThreshold = CONFIG.bufferThreshold;
-            dataChannel.onbufferedamountlow = () => {
-                dataChannel.onbufferedamountlow = null;
-                resolve();
-            };
+            // addEventListener rather than onbufferedamountlow: a file transfer and a
+            // shared-text send may wait on the same channel at once, and a single
+            // handler property would let one overwrite (and stall) the other.
+            dataChannel.addEventListener('bufferedamountlow', resolve, { once: true });
         });
 
         if (dataChannel.readyState !== 'open') {
@@ -933,6 +966,10 @@ function handleDataChannelMessage(event, peerId) {
 
             case 'transfer-resume':
                 handleTransferResume(message, peerId);
+                break;
+
+            case 'text-sync':
+                handleP2PTextChunk(message, peerId);
                 break;
         }
     } catch (error) {
@@ -1191,6 +1228,7 @@ function handleTransferResume(message, peerId) {
 function handlePeerDisconnect(peerId) {
     state.peers.delete(peerId);
     state.peerLocality.delete(peerId);
+    state.sharedText.p2pIncoming.delete(peerId);
 
     // Close connection
     const connection = state.connections.get(peerId);
@@ -1793,8 +1831,20 @@ function initSharedText() {
     ts.copyBtn = document.getElementById('tsCopyBtn');
     ts.clearBtn = document.getElementById('tsClearBtn');
     ts.closeBtn = document.getElementById('tsCloseBtn');
+    ts.lanToggle = document.getElementById('tsLanOnly');
+    ts.hint = document.getElementById('tsHint');
 
     if (!ts.fab || !ts.modal || !ts.textarea) return;
+
+    // LAN-only is a per-device preference, off by default
+    try {
+        state.sharedText.lanOnly = localStorage.getItem('sharedTextLanOnly') === '1';
+    } catch (_) { /* storage unavailable — stay off */ }
+    if (ts.lanToggle) {
+        ts.lanToggle.checked = state.sharedText.lanOnly;
+        ts.lanToggle.addEventListener('change', () => setLanOnlyText(ts.lanToggle.checked));
+    }
+    updateSharedHint();
 
     ts.fab.addEventListener('click', openSharedText);
     ts.closeBtn.addEventListener('click', closeSharedText);
@@ -1855,12 +1905,189 @@ function isSharedChannelReady() {
     return state.localMode || state.inRoom;
 }
 
-function updateSharedStatus() {
-    if (!isSharedChannelReady()) {
+function updateSharedStatus(force) {
+    if (state.sharedText.lanOnly) {
+        const { ready } = getLanTextTargets();
+        if (ready.length > 0) {
+            setSharedStatus(`LAN only · ${ready.length} local device${ready.length > 1 ? 's' : ''}`, 'synced');
+        } else {
+            setSharedStatus('LAN only · waiting for a verified local device', '');
+        }
+    } else if (!isSharedChannelReady()) {
         setSharedStatus('Join a room to sync live', '');
-    } else if (!ts.status.textContent || ts.status.textContent === 'Idle') {
+    } else if (force || !ts.status.textContent || ts.status.textContent === 'Idle') {
         setSharedStatus('Live', 'synced');
     }
+}
+
+function updateSharedHint() {
+    if (!ts.hint) return;
+    ts.hint.textContent = state.sharedText.lanOnly
+        ? 'LAN only: text goes directly device-to-device over the encrypted P2P connection and never through the server. Only devices verified to be on your local network receive it.'
+        : 'Types live to every device in this room. Formatting is preserved — paste code, copy it back byte-for-byte anywhere.';
+}
+
+// ── LAN-only mode ──
+// Shared text travels over the same WebRTC data channel as files instead of the
+// server relay, and only to peers whose route was verified local (or confirmed
+// by the user). Receiving still works from both paths.
+function setLanOnlyText(on) {
+    const st = state.sharedText;
+    st.lanOnly = !!on;
+    try {
+        localStorage.setItem('sharedTextLanOnly', st.lanOnly ? '1' : '0');
+    } catch (_) { /* not persisted — fine */ }
+    if (ts.lanToggle) ts.lanToggle.checked = st.lanOnly;
+    updateSharedHint();
+    updateSharedStatus(true);
+
+    if (st.lanOnly) {
+        connectPeersForLanText();
+        // Push the current text to peers that are already reachable locally
+        if (ts.textarea && ts.textarea.value) {
+            sendSharedTextP2P('hello');
+        }
+    }
+}
+
+// Peers that may receive LAN-only text right now, and how many are left out.
+function getLanTextTargets() {
+    const ready = [];
+    let skipped = 0;
+    state.peers.forEach((_, peerId) => {
+        const dc = state.dataChannels.get(peerId);
+        const locality = state.peerLocality.get(peerId);
+        if (dc && dc.readyState === 'open' && (locality === 'verified' || locality === 'confirmed')) {
+            ready.push(peerId);
+        } else {
+            skipped++;
+        }
+    });
+    return { ready, skipped };
+}
+
+// In LAN-only mode every peer needs a data channel, so connect to them all
+// instead of waiting for the user to click each device.
+function connectPeersForLanText() {
+    if (!state.sharedText.lanOnly) return;
+    state.peers.forEach((_, peerId) => {
+        const conn = state.connections.get(peerId);
+        if (conn && !['failed', 'closed', 'disconnected'].includes(conn.connectionState)) return;
+        connectToPeer(peerId);
+    });
+}
+
+// Called when a peer's route gets classified and when its data channel opens —
+// these happen in either order, so catch-up is sent once both are done.
+function onPeerRouteChecked(peerId) {
+    if (!state.sharedText.lanOnly || !ts.textarea) return;
+    updateSharedStatus(true);
+
+    const dc = state.dataChannels.get(peerId);
+    if (!dc || !getLanTextTargets().ready.includes(peerId)) return;
+    if (lanHelloSent.has(dc)) return;
+    lanHelloSent.add(dc);
+    if (ts.textarea.value) {
+        sendSharedTextP2P('hello', [peerId]);
+    }
+}
+const lanHelloSent = new WeakSet(); // data channels that already got the catch-up text
+
+// Compress + chunk the current text and send it over the data channels.
+// kind 'live' = a local edit (a newer edit supersedes a queued older one);
+// kind 'hello' = catch-up sent when a peer becomes reachable.
+// Resolves to { sent, skipped }, or null if superseded by a newer edit.
+function sendSharedTextP2P(kind, onlyPeers) {
+    const st = state.sharedText;
+    const liveSeq = kind === 'live' ? ++st.p2pLiveSeq : st.p2pLiveSeq;
+
+    const job = st.p2pChain.then(async () => {
+        if (kind === 'live' && liveSeq !== st.p2pLiveSeq) return null;
+
+        let { ready, skipped } = getLanTextTargets();
+        if (onlyPeers) ready = ready.filter(id => onlyPeers.includes(id));
+        if (ready.length === 0) return { sent: 0, skipped };
+
+        const text = ts.textarea.value;
+        const language = ts.language.value;
+        const { enc, b64 } = await encodeSharedText(text);
+        const rev = (state.clientId || 'me') + '-p2p-' + (++st.revCounter);
+        const count = Math.max(1, Math.ceil(b64.length / TS_P2P_CHUNK_SIZE));
+
+        let sent = 0;
+        for (const peerId of ready) {
+            const dc = state.dataChannels.get(peerId);
+            try {
+                for (let seq = 0; seq < count; seq++) {
+                    await sendWithFlowControl(dc, JSON.stringify({
+                        type: 'text-sync',
+                        kind, rev, seq, count, enc, language,
+                        updatedAt: st.updatedAt,
+                        data: b64.slice(seq * TS_P2P_CHUNK_SIZE, (seq + 1) * TS_P2P_CHUNK_SIZE)
+                    }));
+                }
+                sent++;
+            } catch (e) {
+                console.error(`Shared text P2P send to ${peerId} failed:`, e);
+                skipped++;
+            }
+        }
+        return { sent, skipped };
+    });
+
+    // Keep the chain alive even if a step throws
+    st.p2pChain = job.catch(() => null);
+    return job;
+}
+
+// Reassemble a shared-text payload received over a data channel.
+function handleP2PTextChunk(message, peerId) {
+    if (!ts.textarea) return;
+    const { rev, seq, count, data } = message;
+    if (typeof rev !== 'string' || typeof data !== 'string' ||
+        !Number.isInteger(seq) || !Number.isInteger(count) ||
+        count < 1 || count > TS_P2P_MAX_CHUNKS || seq < 0 || seq >= count) return;
+
+    const st = state.sharedText;
+    let inc = st.p2pIncoming.get(peerId);
+    if (!inc || inc.rev !== rev) {
+        inc = { rev, count, parts: new Array(count), received: 0 };
+        st.p2pIncoming.set(peerId, inc);
+    }
+    if (inc.parts[seq] === undefined) {
+        inc.parts[seq] = data;
+        inc.received++;
+    }
+    if (inc.received < inc.count) {
+        setSharedStatus(`Receiving… ${inc.received}/${inc.count}`, 'remote');
+        return;
+    }
+    st.p2pIncoming.delete(peerId);
+
+    const peerName = state.peers.get(peerId)?.name || 'device';
+    const theirTime = typeof message.updatedAt === 'number' ? message.updatedAt : 0;
+
+    decodeSharedText(inc.parts.join(''), message.enc).then(text => {
+        if (message.kind === 'hello' && ts.textarea.value && ts.textarea.value !== text) {
+            // Catch-up from a peer: keep whichever text is newer. If ours is
+            // newer, answer with it so both sides converge.
+            if (theirTime < st.updatedAt) {
+                if (st.lanOnly) sendSharedTextP2P('hello', [peerId]);
+                return;
+            }
+            if (theirTime === st.updatedAt) return;
+        }
+
+        // The sender keeps this text inside the LAN — follow suit, otherwise our
+        // next edit would carry it to the server.
+        if (!st.lanOnly) {
+            setLanOnlyText(true);
+            showToast(`Shared text switched to LAN only (${peerName} shares it only on the local network)`, 'info');
+        }
+        applyRemoteText(text, message.language, peerName, theirTime || Date.now());
+    }).catch(err => {
+        console.error('Shared text P2P decode failed:', err);
+    });
 }
 
 function setSharedStatus(text, cls) {
@@ -1879,6 +2106,8 @@ function escapeHtml(str) {
 const TS_HIGHLIGHT_MAX = 100 * 1024;
 const TS_CHUNK_SIZE = 128 * 1024;         // base64 chars per outgoing chunk
 const TS_MAX_CHARS = 80 * 1024 * 1024;    // hard client cap on raw text length
+const TS_P2P_CHUNK_SIZE = 64 * 1024;      // base64 chars per data-channel message (well under SCTP limits)
+const TS_P2P_MAX_CHUNKS = 2000;           // reject absurd incoming chunk counts
 
 function renderSharedHighlight() {
     if (!ts.textarea || !ts.code) return;
@@ -1960,10 +2189,13 @@ function sendSharedText(immediate) {
         clearTimeout(state.sharedText.timer);
         state.sharedText.timer = null;
     }
+    // Only called for local changes — remember when the text last changed
+    state.sharedText.updatedAt = Date.now();
 
     const doSend = async () => {
         state.sharedText.timer = null;
-        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+        const lanOnly = state.sharedText.lanOnly;
+        if (!lanOnly && (!state.ws || state.ws.readyState !== WebSocket.OPEN)) return;
 
         const text = ts.textarea.value;
         const language = ts.language.value;
@@ -1973,6 +2205,27 @@ function sendSharedText(immediate) {
         if (text.length > TS_MAX_CHARS) {
             setSharedStatus('Too large to sync (over 80M chars)', '');
             showToast('Text is too large to share', 'error');
+            return;
+        }
+
+        if (lanOnly) {
+            try {
+                const res = await sendSharedTextP2P('live');
+                if (!res) return; // superseded by a newer edit
+                state.sharedText.lastSentSig = sig;
+                if (res.sent > 0) {
+                    setSharedStatus(
+                        `LAN only · sent to ${res.sent} device${res.sent > 1 ? 's' : ''}` +
+                        (res.skipped ? ` · ${res.skipped} not verified local` : ''),
+                        'synced'
+                    );
+                } else {
+                    setSharedStatus('LAN only · no verified local device — kept on this device', '');
+                }
+            } catch (e) {
+                console.error('Shared text P2P send failed:', e);
+                setSharedStatus('Sync failed', '');
+            }
             return;
         }
 
@@ -2053,8 +2306,9 @@ function handleTextUpdateChunk(message) {
 
 // Apply fully-assembled remote text without echoing it back. Programmatic
 // .value assignment does not fire 'input', so no re-send loop occurs.
-function applyRemoteText(text, language, fromName) {
+function applyRemoteText(text, language, fromName, updatedAt) {
     if (!ts.textarea || typeof text !== 'string') return;
+    state.sharedText.updatedAt = updatedAt || Date.now();
 
     if (typeof language === 'string' && language &&
         [...ts.language.options].some(o => o.value === language)) {
@@ -2163,12 +2417,14 @@ async function loadVersionInfo() {
     try {
         const res = await fetch('/api/version');
         const data = await res.json();
-        const el = document.getElementById('appVersion');
-        if (el && data.version) {
+        const link = document.getElementById('appVersionLink');
+        const deploy = document.getElementById('appDeploy');
+        if (link && data.version) {
             const d = new Date(data.startedAt);
             const pad = n => String(n).padStart(2, '0');
             const stamp = `${d.getFullYear()}.${pad(d.getMonth()+1)}.${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-            el.textContent = `v${data.version} · deploy ${stamp}`;
+            link.textContent = `v${data.version}`;
+            if (deploy) deploy.textContent = ` · deploy ${stamp}`;
         }
     } catch (e) {
         // silent — footer keeps the static fallback

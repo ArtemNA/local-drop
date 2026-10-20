@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>What's New - Local File Transfer</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%234CAF50' d='M9 16.17L4.83 12l-1.42 1.41L9 19L21 7l-1.41-1.41L9 16.17z'/%3E%3C/svg%3E">
+    <script>
+        // Apply the saved theme before first paint (same key as the main app)
+        try {
+            document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'dark');
+        } catch (_) {
+            document.documentElement.setAttribute('data-theme', 'dark');
+        }
+    </script>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .changelog {
+            max-width: 760px;
+        }
+        .changelog-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .back-link {
+            color: var(--primary-color);
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .back-link:hover {
+            text-decoration: underline;
+        }
+        .release {
+            background: var(--card-bg);
+            border-radius: var(--radius-lg);
+            padding: 24px;
+            margin-bottom: 16px;
+            box-shadow: var(--shadow-md);
+            user-select: text;
+        }
+        .release * {
+            user-select: text;
+        }
+        .release-head {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+        .release-version {
+            font-size: 1.3rem;
+            font-weight: 700;
+        }
+        .release-date {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        .release-tag {
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: var(--primary-color);
+            color: #fff;
+        }
+        .release h3 {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            margin: 12px 0 4px;
+        }
+        .release ul {
+            padding-left: 20px;
+        }
+        .release li {
+            margin: 4px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container changelog">
+        <header>
+            <div class="changelog-header">
+                <h1>What's New</h1>
+                <a class="back-link" href="/">&larr; Back to app</a>
+            </div>
+            <p class="subtitle">Release notes for Local File Transfer</p>
+        </header>
+
+        <!-- Newest first. Keep entries user-facing: describe what changed, not how it is implemented or protected. -->
+
+        <article class="release">
+            <div class="release-head">
+                <span class="release-version">v2.2.0</span>
+                <span class="release-date">October 20, 2026</span>
+                <span class="release-tag">Latest</span>
+            </div>
+            <h3>New</h3>
+            <ul>
+                <li><strong>LAN only</strong> switch for Shared text (off by default). When it is on, text goes directly from device to device over the encrypted peer-to-peer connection, the same way files do, and never passes through the server. Only devices confirmed to be on your local network receive it.</li>
+                <li>When a device shares text in LAN-only mode, devices that receive it switch to LAN only too, so the text stays inside the local network.</li>
+                <li>This page. Click the version number at the bottom of the app to open it.</li>
+            </ul>
+            <h3>Improved</h3>
+            <ul>
+                <li>More reliable connection when two devices connect to each other at the same moment.</li>
+                <li>Shared text and file transfers can use the same connection at the same time without stalling each other.</li>
+            </ul>
+        </article>
+
+        <article class="release">
+            <div class="release-head">
+                <span class="release-version">v2.1.0 update</span>
+                <span class="release-date">July 9, 2026</span>
+            </div>
+            <h3>New</h3>
+            <ul>
+                <li><strong>Shared text</strong>: a live shared clipboard for everyone in the room (or on the local network in local mode). Open it with the round button in the corner.</li>
+                <li>Syntax highlighting for common languages, plus Copy and Clear-for-everyone buttons.</li>
+                <li>Formatting is preserved exactly, so pasted code copies back byte-for-byte on another device.</li>
+                <li>Large texts are supported, and devices that join later receive the current text.</li>
+            </ul>
+        </article>
+
+        <article class="release">
+            <div class="release-head">
+                <span class="release-version">v2.1.0</span>
+                <span class="release-date">April 2, 2026</span>
+            </div>
+            <h3>New</h3>
+            <ul>
+                <li>The app version and deploy time are shown at the bottom of the page.</li>
+                <li>Connection check before sending files: transfers over a verified local route start right away, and you are asked to confirm when the route cannot be verified.</li>
+            </ul>
+            <h3>Improved</h3>
+            <ul>
+                <li>Faster transfers of large files and archives.</li>
+                <li>Very large files can be saved straight to disk in supported browsers.</li>
+                <li>Received files are checked for completeness.</li>
+                <li>Fixes for interrupted and stalled file transfers.</li>
+            </ul>
+        </article>
+
+        <article class="release">
+            <div class="release-head">
+                <span class="release-version">Earlier releases</span>
+                <span class="release-date">August 2025</span>
+            </div>
+            <ul>
+                <li>First release: peer-to-peer file transfer between devices in the browser.</li>
+                <li>Rooms with 6-character codes and shareable room links for use over the internet.</li>
+                <li>Automatic rooms for devices on the same network.</li>
+                <li>Send files by drag &amp; drop or by tapping a connected device (mobile-friendly).</li>
+                <li>Editable device names, synced to other devices.</li>
+                <li>Dark theme by default, with a light/dark switch.</li>
+                <li>Better reliability for large files.</li>
+            </ul>
+        </article>
+    </div>
+</body>
+</html>
