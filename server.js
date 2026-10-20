@@ -114,6 +114,10 @@ const SNAP_CHUNK = 128 * 1024;            // chunk size when streaming a snapsho
 const MAX_TEXT_COUNT = Math.ceil(MAX_TEXT_TOTAL / (64 * 1024));
 const TEXT_ENCODINGS = new Set(['gzip', 'raw']);
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+const TEXT_RATE_BYTES = 30 * 1024 * 1024;         // per client per minute (compressed+base64)
+const TEXT_MEMORY_BUDGET = 200 * 1024 * 1024;     // all snapshots + reassembly buffers together
+const SNAPSHOT_TTL_MS = 12 * 60 * 60 * 1000;      // drop snapshots nobody has updated for this long
+const SNAP_BUFFER_HIGH = 1024 * 1024;             // pause snapshot streaming above this ws.bufferedAmount
 
 const sharedTexts = new Map();  // channelKey -> { enc, language, data (base64), updatedAt }
 const pendingTexts = new Map(); // channelKey -> in-progress reassembly { rev, count, parts, received, bytes, enc, language }
@@ -158,6 +162,24 @@ function handleTextShare(clientInfo, message) {
 
     const lang = typeof language === 'string' ? language.slice(0, 30) : 'auto';
 
+    // Per-client rate limit. Over the limit, chunks are dropped (not relayed)
+    // until the window resets; the sender is told once per window.
+    const now = Date.now();
+    if (now - clientInfo.textWindowStart > 60000) {
+        clientInfo.textWindowStart = now;
+        clientInfo.textBytes = 0;
+        clientInfo.textLimitNotified = false;
+    }
+    clientInfo.textBytes += data.length;
+    if (clientInfo.textBytes > TEXT_RATE_BYTES) {
+        if (!clientInfo.textLimitNotified) {
+            clientInfo.textLimitNotified = true;
+            sendTextError(clientInfo, 'TEXT_RATE_LIMIT',
+                'Shared text is changing too fast to sync through the server. Wait a minute or turn on "LAN only".');
+        }
+        return;
+    }
+
     // 1) Account for the chunk first, so an oversized payload is neither stored
     //    nor relayed.
     let pend = pendingTexts.get(key);
@@ -181,16 +203,15 @@ function handleTextShare(clientInfo, message) {
 
     if (pend.bytes + data.length > MAX_TEXT_TOTAL) {
         // Too big — drop what we have and ignore the rest of this revision.
-        pend.rejected = true;
-        pend.parts = [];
-        pend.bytes = 0;
-        if (clientInfo.ws.readyState === 1) {
-            clientInfo.ws.send(JSON.stringify({
-                type: 'error',
-                message: 'Shared text is too large to sync through the server. Turn on "LAN only" to share it directly.',
-                code: 'TEXT_TOO_LARGE'
-            }));
-        }
+        rejectTextRevision(pend);
+        sendTextError(clientInfo, 'TEXT_TOO_LARGE',
+            'Shared text is too large to sync through the server. Turn on "LAN only" to share it directly.');
+        return;
+    }
+    if (!makeRoomForText(data.length, key)) {
+        rejectTextRevision(pend);
+        sendTextError(clientInfo, 'TEXT_SERVER_BUSY',
+            'The server is low on space for shared text right now. Try again later or turn on "LAN only".');
         return;
     }
     pend.parts[seq] = data;
@@ -217,19 +238,64 @@ function handleTextShare(clientInfo, message) {
     }
 }
 
+function rejectTextRevision(pend) {
+    pend.rejected = true;
+    pend.parts = [];
+    pend.bytes = 0;
+}
+
+function sendTextError(clientInfo, code, message) {
+    if (clientInfo.ws.readyState === 1) {
+        clientInfo.ws.send(JSON.stringify({ type: 'error', message, code }));
+    }
+}
+
+// Bytes currently held for shared text (base64 strings are one byte per char).
+function textMemoryUsed() {
+    let used = 0;
+    for (const snap of sharedTexts.values()) used += snap.data.length;
+    for (const pend of pendingTexts.values()) used += pend.bytes;
+    return used;
+}
+
+// Make sure `bytes` more fit in the global budget, evicting the least recently
+// updated snapshots of other channels if needed. Returns false if it can't.
+function makeRoomForText(bytes, keepKey) {
+    let used = textMemoryUsed();
+    if (used + bytes <= TEXT_MEMORY_BUDGET) return true;
+
+    const victims = [...sharedTexts.entries()]
+        .filter(([key]) => key !== keepKey)
+        .sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+    for (const [key, snap] of victims) {
+        sharedTexts.delete(key);
+        used -= snap.data.length;
+        console.warn(`[Text] Evicted snapshot of ${key} to stay within memory budget`);
+        if (used + bytes <= TEXT_MEMORY_BUDGET) return true;
+    }
+    return false;
+}
+
 // Stream the current channel snapshot to a single (usually just-joined) client,
 // chunked the same way live edits are, so the client reuses one reassembly path.
-function streamSnapshotTo(clientInfo, key) {
+// Waits for the socket to drain between chunks instead of queueing it all at once.
+async function streamSnapshotTo(clientInfo, key) {
     const snap = sharedTexts.get(key);
     if (!snap || !snap.data) return;
 
     const data = snap.data;
     const count = Math.max(1, Math.ceil(data.length / SNAP_CHUNK));
     const rev = 'snap-' + (snapRevCounter++);
+    const ws = clientInfo.ws;
 
     for (let seq = 0; seq < count; seq++) {
-        if (clientInfo.ws.readyState !== 1) break;
-        clientInfo.ws.send(JSON.stringify({
+        while (ws.readyState === 1 && ws.bufferedAmount > SNAP_BUFFER_HIGH) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        // Stop if the client left or a newer snapshot replaced this one — the
+        // client already gets the newer text as a live update.
+        if (ws.readyState !== 1 || sharedTexts.get(key) !== snap) return;
+        ws.send(JSON.stringify({
             type: 'text-update',
             rev, seq, count,
             enc: snap.enc,
@@ -267,7 +333,10 @@ wss.on('connection', (ws, req) => {
         roomCode: null,
         bytesReceived: 0,
         messageCount: 0,
-        lastResetTime: Date.now()
+        lastResetTime: Date.now(),
+        textBytes: 0,
+        textWindowStart: Date.now(),
+        textLimitNotified: false
     };
 
     clients.set(clientId, clientInfo);
@@ -817,8 +886,8 @@ function sweepSharedTexts() {
             pendingTexts.delete(key);
         }
     }
-    for (const [key] of sharedTexts) {
-        if (!channelHasClients(key)) {
+    for (const [key, snap] of sharedTexts) {
+        if (!channelHasClients(key) || now - snap.updatedAt > SNAPSHOT_TTL_MS) {
             sharedTexts.delete(key);
         }
     }

@@ -21,7 +21,9 @@ const state = {
     inRoom: false,
     localMode: false,
     sharedText: {
-        timer: null, revCounter: 0, lastSentSig: null, incoming: null, sending: false,
+        timer: null, revCounter: 0, lastSentSig: null, sending: false,
+        incoming: new Map(),      // rev -> in-progress reassembly of server-relayed text
+        lastChangeAt: 0,          // local clock time of the last local or remote change
         lanOnly: false,           // LAN-only mode: sync over P2P data channels, never via the server
         updatedAt: 0,             // when the current text was last changed (by anyone)
         p2pIncoming: new Map(),   // peerId -> in-progress P2P reassembly
@@ -2192,6 +2194,7 @@ function sendSharedText(immediate) {
     }
     // Only called for local changes — remember when the text last changed
     state.sharedText.updatedAt = Date.now();
+    state.sharedText.lastChangeAt = Date.now();
 
     const doSend = async () => {
         state.sharedText.timer = null;
@@ -2281,14 +2284,22 @@ function sendSharedText(immediate) {
 function handleTextUpdateChunk(message) {
     if (!ts.textarea) return;
     const { rev, seq, count, enc, language, data, fromName } = message;
-    if (typeof rev !== 'string' || typeof seq !== 'number' ||
-        typeof count !== 'number' || typeof data !== 'string') return;
+    if (typeof rev !== 'string' || typeof data !== 'string' ||
+        !Number.isInteger(seq) || !Number.isInteger(count) ||
+        count < 1 || count > TS_P2P_MAX_CHUNKS || seq < 0 || seq >= count) return;
 
+    // Several revisions can be in flight at once (e.g. a join snapshot streaming
+    // while a peer types), so reassemble each separately.
     const st = state.sharedText;
-    if (!st.incoming || st.incoming.rev !== rev) {
-        st.incoming = { rev, count, enc, language, fromName, parts: new Array(count), received: 0 };
+    let inc = st.incoming.get(rev);
+    if (!inc) {
+        if (st.incoming.size >= 4) {
+            st.incoming.delete(st.incoming.keys().next().value); // drop the oldest
+        }
+        inc = { rev, count, enc, language, fromName, parts: new Array(count), received: 0, startedAt: Date.now() };
+        st.incoming.set(rev, inc);
     }
-    const inc = st.incoming;
+    if (inc.count !== count) return;
     if (inc.parts[seq] === undefined) {
         inc.parts[seq] = data;
         inc.received++;
@@ -2302,8 +2313,10 @@ function handleTextUpdateChunk(message) {
     if (inc.received < inc.count) return;
 
     const b64 = inc.parts.join('');
-    st.incoming = null;
+    st.incoming.delete(rev);
     decodeSharedText(b64, inc.enc).then(text => {
+        // A join snapshot is older than any edit made while it was streaming
+        if (rev.startsWith('snap-') && st.lastChangeAt > inc.startedAt) return;
         applyRemoteText(text, inc.language, inc.fromName);
     }).catch(err => {
         console.error('Shared text decode failed:', err);
@@ -2315,6 +2328,7 @@ function handleTextUpdateChunk(message) {
 function applyRemoteText(text, language, fromName, updatedAt) {
     if (!ts.textarea || typeof text !== 'string') return;
     state.sharedText.updatedAt = updatedAt || Date.now();
+    state.sharedText.lastChangeAt = Date.now();
 
     if (typeof language === 'string' && language &&
         [...ts.language.options].some(o => o.value === language)) {
