@@ -16,7 +16,9 @@ A completely local file transfer application that allows secure P2P file sharing
   - **Click to Select**: Click connected device to open file picker (mobile-friendly!)
 - **🖼️ Image Preview**: Preview images before sending
 - **📊 Progress Tracking**: Real-time progress bars with speed indicators
-- **🔄 Resume Support**: Automatically resume interrupted transfers
+- **⏸️ Pause & Resume**: Pause from either device; transfers continue automatically after a brief connection drop
+- **📝 Shared Text**: Live shared clipboard with syntax highlighting. By default (**LAN only**) it goes directly between devices on your local network and never through the server
+- **💾 Large Files**: Very large files can be streamed straight to disk ("Save to disk") in supported browsers
 - **📦 Queue System**: Send multiple files in a queue
 - **🔌 Auto-Reconnection**: Automatically reconnects if connection is lost
 - **💬 Two-Way Communication**: Both peers can send files in the same session
@@ -26,7 +28,7 @@ A completely local file transfer application that allows secure P2P file sharing
 
 ### Prerequisites
 
-- Node.js (v14 or higher)
+- Node.js (v18 or higher)
 - npm or yarn
 
 ### Installation
@@ -62,10 +64,10 @@ PUBLIC_DEPLOY=true npm start
 PUBLIC_DEPLOY=true AUTO_ROOM=true npm start
 ```
 - Devices from same local network auto-join same room
-- Uses WebRTC to detect client's local IP
+- "Same network" = same public IP as seen by the server (devices behind one router/NAT)
 - Perfect for offices, schools, cafes
 - Users can still create/join manual rooms if needed
-- Room codes generated from local network IP
+- Room codes are derived from the IP with a server secret (`AUTO_ROOM_SECRET`), so they can't be guessed from an address
 
 ### Deployment Options
 
@@ -141,7 +143,8 @@ git push heroku public-deploy-rooms:main
 
 ### Room Isolation
 - Each room is completely isolated
-- Room codes are randomly generated (1.6 billion combinations)
+- Room codes are randomly generated (about 2.2 billion combinations)
+- Room creation and shared text through the server are rate-limited
 - No data is stored on the server
 - Rooms are automatically deleted when empty
 
@@ -157,6 +160,16 @@ When deployed publicly, the app:
 - WebRTC provides built-in encryption
 - Server never sees file content
 - Automatic blocking of server transfer attempts
+
+### Shared Text
+- **LAN only** (default): text travels over the same encrypted peer-to-peer
+  connection as files, only to devices whose connection is verified as local.
+  The server never sees it.
+- With **LAN only** off, text is relayed through the server so it also works
+  between different networks. The server keeps the latest text in memory for
+  devices that join later (until the room empties); it is protected in transit
+  (HTTPS/WSS) but readable by the server.
+- Through the server, texts are limited to about 10MB compressed.
 
 ## 🏗️ Architecture
 
@@ -199,20 +212,33 @@ When deployed publicly, the app:
 
 - `PORT`: Server port (default: 3000)
 - `PUBLIC_DEPLOY`: Set to `true` for public deployment with rooms
+- `AUTO_ROOM`: With `PUBLIC_DEPLOY`, put devices from the same network into the same room
+- `AUTO_ROOM_SECRET`: Key for auto-room codes (default: random on every start)
+- `TRUSTED_PROXY_HOPS`: Number of reverse proxies in front of the app (default: 1)
+- `MAINTENANCE_MODE`: Set to `true` to show the maintenance page
 
 ### Client Configuration
 Edit `CONFIG` object in `public/app.js`:
 
 ```javascript
 const CONFIG = {
-    iceServers: [...],        // STUN/TURN servers
-    chunkSize: 16384,         // Size of each chunk (16KB default)
-    reconnectDelay: 3000,     // Delay before reconnection attempt
-    reconnectMaxAttempts: 5,  // Maximum reconnection attempts
-    pingInterval: 30000,      // Keep-alive ping interval
-    fileTransferTimeout: 300000 // File transfer timeout (5 min)
+    iceServers: [...],                // STUN/TURN servers
+    chunkSize: 64 * 1024,             // Fallback chunk size (adapted to the connection, up to 256KB)
+    bufferThreshold: 2 * 1024 * 1024, // Pause sending above this much buffered data
+    reconnectDelay: 3000,             // Base delay before a reconnection attempt
+    reconnectMaxAttempts: 5,          // Maximum server reconnection attempts
+    pingInterval: 30000               // Keep-alive ping interval
 };
 ```
+
+## 🧪 Tests
+
+```bash
+npm test
+```
+
+Starts the server in each mode and checks it over WebSocket/HTTP (input
+validation, limits, rooms). No extra dependencies.
 
 ## 📱 Browser Support
 

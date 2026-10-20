@@ -110,9 +110,11 @@ When users open this link, they automatically join room ABC123
 - Try smaller files first (<10MB)
 - Ensure good internet connection
 
-### "Everyone in same room"
-- Do NOT use `AUTO_ROOM=true` with public deployment
-- This puts all users in one room (server IP is same for all)
+### "Everyone in same room" (with `AUTO_ROOM=true`)
+- Auto rooms group devices by the public IP the server sees
+- Behind a reverse proxy that IP comes from `X-Forwarded-For`; if every user
+  lands in one room, the server is seeing the proxy's address — set
+  `TRUSTED_PROXY_HOPS` to the number of proxies in front of the app (default 1)
 
 ## Security Considerations
 
@@ -121,19 +123,14 @@ When users open this link, they automatically join room ABC123
    - Use platform's built-in SSL
    - Or add Cloudflare in front
 
-2. **Add rate limiting**
-   ```javascript
-   // In server.js
-   const rateLimit = require('express-rate-limit');
-   app.use(rateLimit({
-     windowMs: 15 * 60 * 1000, // 15 minutes
-     max: 100 // limit each IP to 100 requests
-   }));
-   ```
+2. **Built-in limits** (no setup needed)
+   - Room codes: 6 letters/digits; at most 20 new rooms per IP per 10 minutes
+   - Shared text through the server: 10MB per text (compressed), 30MB per
+     client per minute, 200MB for all rooms together
+   - WebSocket messages over 1MB are rejected
 
-3. **Add room limits**
+3. **Possible additions**
    - Max users per room
-   - Room expiration after inactivity
    - Password-protected rooms (future feature)
 
 4. **Monitor usage**
@@ -147,7 +144,10 @@ When users open this link, they automatically join room ABC123
 |----------|--------|-------------|
 | `PORT` | Number | Server port (default: 3000) |
 | `PUBLIC_DEPLOY` | true/false | Enable room system for public deployment |
-| `AUTO_ROOM` | true/false | ⚠️ DO NOT use with PUBLIC_DEPLOY |
+| `AUTO_ROOM` | true/false | With `PUBLIC_DEPLOY`: devices on the same network (same public IP) join the same room automatically |
+| `AUTO_ROOM_SECRET` | String | Key for auto-room codes; set it to keep codes stable across restarts (default: random per start) |
+| `TRUSTED_PROXY_HOPS` | Number | Reverse proxies in front of the app, used to read the client IP from `X-Forwarded-For` (default: 1) |
+| `MAINTENANCE_MODE` | true/false | Show the maintenance page to all visitors |
 
 ## Recommended Platforms
 

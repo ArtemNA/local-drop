@@ -9,9 +9,9 @@
 1. **Flow Control**: The app now monitors `bufferedAmount` and waits for the buffer to clear before sending more data
 2. **Binary Transfer**: Files are now sent as binary data instead of JSON-encoded arrays (much more efficient)
 3. **Optimized Settings**:
-   - Chunk size: 64KB (optimal for most networks)
-   - Buffer threshold: 8MB (prevents overflow)
-   - Check interval: 25ms (responsive flow control)
+   - Chunk size: up to 256KB, adapted to what the connection allows (64KB fallback)
+   - Buffer threshold: 2MB (prevents overflow)
+   - Sending resumes on the `bufferedamountlow` event (no polling)
 
 ### If you still experience issues:
 
@@ -89,11 +89,15 @@ iceServers: [
 
 ### "Connection lost during transfer"
 
-The app will automatically try to reconnect and resume. If it fails:
+If the peer-to-peer connection drops while both pages stay open, the app
+reconnects (up to 3 attempts) and the transfer continues from where it
+stopped. You can also press **Pause** / **Resume** on either device.
 
-1. Refresh both devices
-2. Rejoin the same room
-3. Transfer will resume from where it stopped
+If it can't reconnect:
+
+1. Click the device again to reconnect, then press **Resume**
+2. If a page was refreshed or closed, the transfer can't be resumed
+   (the device rejoins with a new identity) — cancel it and send the file again
 
 ## Server Deployment Issues
 
