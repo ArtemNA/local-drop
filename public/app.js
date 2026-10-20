@@ -87,10 +87,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Initialize theme
     initializeTheme();
     
-    // Try to detect local IP for auto-room feature
-    state.localIP = await getLocalIP();
-    console.log('Detected local IP:', state.localIP);
-    
+    // Local IP is only a hint for the locality check — detect it in the
+    // background instead of delaying startup
+    getLocalIP().then(ip => {
+        state.localIP = ip;
+        console.log('Detected local IP:', ip);
+    });
+
     loadDeviceName();
     initSharedText();
     initializeWebSocket();
@@ -133,11 +136,6 @@ function initializeWebSocket() {
     
     if (roomFromUrl) {
         params.append('room', roomFromUrl);
-    }
-    
-    // Include local IP if detected (for auto-room feature)
-    if (state.localIP) {
-        params.append('localIP', state.localIP);
     }
     
     // Include saved device name

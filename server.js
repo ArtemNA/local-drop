@@ -57,32 +57,122 @@ function generateRoomCode() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     let code = '';
     for (let i = 0; i < 6; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
+        code += chars.charAt(crypto.randomInt(chars.length)); // unpredictable, unlike Math.random
     }
     return code;
 }
 
+// Secret for auto-room codes. Without it anyone could compute the room of a
+// given IP; with it the code is as unguessable as a random one. Set
+// AUTO_ROOM_SECRET to keep codes stable across restarts.
+const AUTO_ROOM_SECRET = process.env.AUTO_ROOM_SECRET || crypto.randomBytes(32).toString('hex');
+
 // Generate room code from IP (for auto-room mode)
 function generateRoomFromIP(ip) {
-    // Clean IP address (remove IPv6 prefix if present)
-    const cleanIP = ip.replace(/^::ffff:/, '');
-
-    // Create a hash of the IP for privacy
-    const hash = crypto.createHash('sha256').update(cleanIP).digest('hex');
-
-    // Take first 6 characters and convert to uppercase alphanumeric
+    const digest = crypto.createHmac('sha256', AUTO_ROOM_SECRET).update(ip).digest();
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     let roomCode = '';
     for (let i = 0; i < 6; i++) {
-        const charCode = hash.charCodeAt(i);
-        if (charCode < 58) { // 0-9
-            roomCode += String.fromCharCode(charCode);
-        } else {
-            // Convert to A-Z
-            roomCode += String.fromCharCode(65 + (charCode % 26));
+        roomCode += chars[digest[i] % chars.length];
+    }
+    return roomCode;
+}
+
+// Client's public IP. Behind a reverse proxy (Render, Heroku, ...) the proxy
+// appends the address it saw to X-Forwarded-For, so trust entries from the
+// right — earlier ones are whatever the client chose to send.
+const TRUSTED_PROXY_HOPS = parseInt(process.env.TRUSTED_PROXY_HOPS || '1', 10);
+
+function getClientIp(req) {
+    let ip = req.socket.remoteAddress || '';
+    const forwardedFor = req.headers['x-forwarded-for'];
+    if (forwardedFor && TRUSTED_PROXY_HOPS > 0) {
+        const hops = forwardedFor.split(',').map(s => s.trim()).filter(Boolean);
+        if (hops.length > 0) {
+            ip = hops[Math.max(0, hops.length - TRUSTED_PROXY_HOPS)];
         }
     }
+    return ip.replace(/^::ffff:/, ''); // Clean IPv6 prefix
+}
 
-    return roomCode;
+// Rooms: 6 uppercase letters/digits. New rooms count against a per-IP limit so
+// one client can't fill the server with empty rooms.
+const ROOM_CODE_RE = /^[A-Z0-9]{6}$/;
+const ROOM_CREATE_LIMIT = 20;
+const ROOM_CREATE_WINDOW_MS = 10 * 60 * 1000;
+const roomCreations = new Map(); // ip -> { count, windowStart }
+
+function ensureRoom(roomCode, ip) {
+    if (rooms.has(roomCode)) return true;
+
+    const now = Date.now();
+    let entry = roomCreations.get(ip);
+    if (!entry || now - entry.windowStart > ROOM_CREATE_WINDOW_MS) {
+        entry = { count: 0, windowStart: now };
+        roomCreations.set(ip, entry);
+    }
+    if (entry.count >= ROOM_CREATE_LIMIT) {
+        console.warn(`[Room] Room creation limit reached for ${ip}`);
+        return false;
+    }
+    entry.count++;
+    rooms.set(roomCode, new Set());
+    console.log(`[Room] Created room ${roomCode}`);
+    return true;
+}
+
+function sendRoomLimitError(clientInfo) {
+    if (clientInfo.ws.readyState === 1) {
+        clientInfo.ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Too many new rooms from your network. Please wait a few minutes.',
+            code: 'ROOM_LIMIT'
+        }));
+    }
+}
+
+// Put a client into a room (creating it if allowed), tell it who is there,
+// catch it up on shared text and announce it to the others.
+function joinRoom(clientInfo, roomCode, extra = {}) {
+    if (clientInfo.roomCode !== roomCode) {
+        if (!ensureRoom(roomCode, clientInfo.ip)) {
+            sendRoomLimitError(clientInfo);
+            return false;
+        }
+        if (clientInfo.roomCode) {
+            leaveRoom(clientInfo.id, clientInfo.roomCode);
+        }
+        rooms.get(roomCode).add(clientInfo.id);
+        clientInfo.roomCode = roomCode;
+        console.log(`[Room] Client ${clientInfo.id} joined room ${roomCode}`);
+
+        broadcastToRoom(roomCode, clientInfo.id, {
+            type: 'peer-joined',
+            peer: {
+                id: clientInfo.id,
+                name: clientInfo.name
+            }
+        });
+    }
+
+    const peersInRoom = getClientsInRoom(roomCode)
+        .filter(client => client.id !== clientInfo.id)
+        .map(client => ({
+            id: client.id,
+            name: client.name
+        }));
+
+    clientInfo.ws.send(JSON.stringify({
+        type: 'room-joined',
+        clientId: clientInfo.id,
+        roomCode: roomCode,
+        deviceName: clientInfo.name,
+        peers: peersInRoom,
+        ...extra
+    }));
+
+    streamSnapshotTo(clientInfo, 'ROOM:' + roomCode);
+    return true;
 }
 
 // Get clients in room
@@ -334,16 +424,10 @@ function handleConnection(ws, req) {
     // Parse URL parameters (fixed base: the Host header is client-controlled)
     const url = new URL(req.url, 'http://localhost');
     const urlRoomCode = url.searchParams.get('room');
-    const clientLocalIP = url.searchParams.get('localIP');
     const deviceName = url.searchParams.get('deviceName');
 
     // Get real client IP (considering proxies)
-    let clientIp = req.socket.remoteAddress;
-    const forwardedFor = req.headers['x-forwarded-for'];
-    if (forwardedFor) {
-        clientIp = forwardedFor.split(',')[0].trim();
-    }
-    clientIp = clientIp.replace(/^::ffff:/, ''); // Clean IPv6 prefix
+    const clientIp = getClientIp(req);
 
     // Initialize client info
     const clientInfo = {
@@ -351,7 +435,6 @@ function handleConnection(ws, req) {
         ws: ws,
         name: sanitizeName(deviceName, `Device-${clientId.slice(0, 6)}`),
         ip: clientIp,
-        localIP: clientLocalIP, // Store client's local IP for auto-room
         roomCode: null,
         bytesReceived: 0,
         messageCount: 0,
@@ -368,7 +451,14 @@ function handleConnection(ws, req) {
         suspiciousActivity: false
     });
 
-    console.log(`[Connect] Client ${clientId} connected from ${clientIp} (local: ${clientLocalIP})`);
+    console.log(`[Connect] Client ${clientId} connected from ${clientIp}`);
+
+    const askForRoom = () => ws.send(JSON.stringify({
+        type: 'init',
+        clientId: clientId,
+        deviceName: clientInfo.name,
+        needsRoom: true
+    }));
 
     // Handle different modes
     if (!PUBLIC_DEPLOY) {
@@ -398,113 +488,23 @@ function handleConnection(ws, req) {
             }
         });
     } else if (urlRoomCode) {
-        // PUBLIC MODE - Join specific room from URL
+        // PUBLIC MODE - Join specific room from URL; on an invalid code or the
+        // room limit, fall back to room selection
         const normalizedRoomCode = urlRoomCode.toUpperCase();
-        console.log(`[Room] Client attempting to join room ${normalizedRoomCode} from URL`);
-
-        // Try to join the room from URL
-        if (normalizedRoomCode.length === 6) {
-            // Create room if it doesn't exist
-            if (!rooms.has(normalizedRoomCode)) {
-                rooms.set(normalizedRoomCode, new Set());
-                console.log(`[Room] Created room ${normalizedRoomCode} from URL`);
-            }
-
-            // Join the room
-            rooms.get(normalizedRoomCode).add(clientId);
-            clientInfo.roomCode = normalizedRoomCode;
-
-            // Get other peers in room
-            const peersInRoom = getClientsInRoom(normalizedRoomCode)
-                .filter(client => client.id !== clientId)
-                .map(client => ({
-                    id: client.id,
-                    name: client.name
-                }));
-
-            // Send room joined message
-            ws.send(JSON.stringify({
-                type: 'room-joined',
-                clientId: clientId,
-                roomCode: normalizedRoomCode,
-                deviceName: clientInfo.name,
-                peers: peersInRoom
-            }));
-
-            streamSnapshotTo(clientInfo, 'ROOM:' + normalizedRoomCode);
-
-            // Notify other room members
-            broadcastToRoom(normalizedRoomCode, clientId, {
-                type: 'peer-joined',
-                peer: {
-                    id: clientId,
-                    name: clientInfo.name
-                }
-            });
-        } else {
-            // Invalid room code, show room selection
-            ws.send(JSON.stringify({
-                type: 'init',
-                clientId: clientId,
-                deviceName: clientInfo.name,
-                needsRoom: true
-            }));
+        if (!ROOM_CODE_RE.test(normalizedRoomCode) || !joinRoom(clientInfo, normalizedRoomCode)) {
+            askForRoom();
         }
-    } else if (AUTO_ROOM_MODE && clientLocalIP) {
-        // AUTO ROOM MODE - Use client's local IP to group devices
-        console.log(`[Auto-Room] Processing client with local IP: ${clientLocalIP}`);
-
-        // Generate room code from local IP
-        const roomCode = generateRoomFromIP(clientLocalIP);
-
-        // Create room if it doesn't exist
-        if (!rooms.has(roomCode)) {
-            rooms.set(roomCode, new Set());
-            console.log(`[Auto-Room] Created room ${roomCode} for local IP ${clientLocalIP}`);
+    } else if (AUTO_ROOM_MODE) {
+        // AUTO ROOM MODE - devices behind the same public IP (same network/NAT)
+        // land in the same room. The IP is the one the server sees, so a client
+        // can't pick someone else's room by claiming their address.
+        const roomCode = generateRoomFromIP(clientIp);
+        if (!joinRoom(clientInfo, roomCode, { autoRoom: true })) {
+            askForRoom();
         }
-
-        // Join the room
-        rooms.get(roomCode).add(clientId);
-        clientInfo.roomCode = roomCode;
-
-        // Get other peers in room
-        const peersInRoom = getClientsInRoom(roomCode)
-            .filter(client => client.id !== clientId)
-            .map(client => ({
-                id: client.id,
-                name: client.name
-            }));
-
-        console.log(`[Auto-Room] Client ${clientId} auto-joined room ${roomCode}`);
-
-        // Send init with room info and peers
-        ws.send(JSON.stringify({
-            type: 'room-joined',
-            clientId: clientId,
-            roomCode: roomCode,
-            deviceName: clientInfo.name,
-            autoRoom: true,
-            peers: peersInRoom
-        }));
-
-        streamSnapshotTo(clientInfo, 'ROOM:' + roomCode);
-
-        // Notify other room members
-        broadcastToRoom(roomCode, clientId, {
-            type: 'peer-joined',
-            peer: {
-                id: clientId,
-                name: clientInfo.name
-            }
-        });
     } else {
         // PUBLIC MODE - Manual room selection
-        ws.send(JSON.stringify({
-            type: 'init',
-            clientId: clientId,
-            deviceName: clientInfo.name,
-            needsRoom: true
-        }));
+        askForRoom();
     }
 
     ws.on('message', (data) => {
@@ -619,10 +619,20 @@ function handleConnection(ws, req) {
                     break;
 
                 case 'join-room':
-                    if (PUBLIC_DEPLOY && typeof message.roomCode === 'string') {
+                    if (PUBLIC_DEPLOY) {
                         // Normalize room code to uppercase
-                        const normalizedCode = message.roomCode.toUpperCase();
-                        handleJoinRoom(clientInfo, normalizedCode);
+                        const normalizedCode = typeof message.roomCode === 'string'
+                            ? message.roomCode.toUpperCase()
+                            : '';
+                        if (!ROOM_CODE_RE.test(normalizedCode)) {
+                            ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'Room codes are 6 letters or digits.',
+                                code: 'INVALID_ROOM_CODE'
+                            }));
+                            break;
+                        }
+                        joinRoom(clientInfo, normalizedCode);
                     }
                     break;
 
@@ -727,19 +737,22 @@ function handleConnection(ws, req) {
 
 // Handle room creation
 function handleCreateRoom(clientInfo) {
-    // Leave current room if in one
-    if (clientInfo.roomCode) {
-        leaveRoom(clientInfo.id, clientInfo.roomCode);
-    }
-
     // Generate unique room code
     let roomCode;
     do {
         roomCode = generateRoomCode();
     } while (rooms.has(roomCode));
 
-    // Create room and add client
-    rooms.set(roomCode, new Set([clientInfo.id]));
+    if (!ensureRoom(roomCode, clientInfo.ip)) {
+        sendRoomLimitError(clientInfo);
+        return;
+    }
+
+    // Leave current room if in one, then add client
+    if (clientInfo.roomCode) {
+        leaveRoom(clientInfo.id, clientInfo.roomCode);
+    }
+    rooms.get(roomCode).add(clientInfo.id);
     clientInfo.roomCode = roomCode;
 
     console.log(`[Room] Client ${clientInfo.id} created room ${roomCode}`);
@@ -751,57 +764,6 @@ function handleCreateRoom(clientInfo) {
         roomCode: roomCode,
         peers: [] // Empty room initially
     }));
-}
-
-// Handle joining room
-function handleJoinRoom(clientInfo, roomCode) {
-    // Normalize room code
-    const normalizedCode = roomCode.toUpperCase();
-
-    // Check if room exists
-    if (!rooms.has(normalizedCode)) {
-        // Create the room if it doesn't exist
-        rooms.set(normalizedCode, new Set());
-        console.log(`[Room] Created room ${normalizedCode} for joining`);
-    }
-
-    // Leave current room if in one
-    if (clientInfo.roomCode) {
-        leaveRoom(clientInfo.id, clientInfo.roomCode);
-    }
-
-    // Join new room
-    rooms.get(normalizedCode).add(clientInfo.id);
-    clientInfo.roomCode = normalizedCode;
-
-    console.log(`[Room] Client ${clientInfo.id} joined room ${normalizedCode}`);
-
-    // Get other peers in room
-    const peersInRoom = getClientsInRoom(normalizedCode)
-        .filter(client => client.id !== clientInfo.id)
-        .map(client => ({
-            id: client.id,
-            name: client.name
-        }));
-
-    // Send room info to joining client
-    clientInfo.ws.send(JSON.stringify({
-        type: 'room-joined',
-        clientId: clientInfo.id,
-        roomCode: normalizedCode,
-        peers: peersInRoom
-    }));
-
-    streamSnapshotTo(clientInfo, 'ROOM:' + normalizedCode);
-
-    // Notify other room members
-    broadcastToRoom(normalizedCode, clientInfo.id, {
-        type: 'peer-joined',
-        peer: {
-            id: clientInfo.id,
-            name: clientInfo.name
-        }
-    });
 }
 
 // Leave room
@@ -905,6 +867,11 @@ function channelHasClients(key) {
 
 function sweepSharedTexts() {
     const now = Date.now();
+    for (const [ip, entry] of roomCreations) {
+        if (now - entry.windowStart > ROOM_CREATE_WINDOW_MS) {
+            roomCreations.delete(ip);
+        }
+    }
     for (const [key, pend] of pendingTexts) {
         if (now - (pend.updatedAt || 0) > PENDING_STALE_MS || !channelHasClients(key)) {
             pendingTexts.delete(key);
