@@ -8,8 +8,7 @@ const CONFIG = {
     bufferThreshold: 2 * 1024 * 1024, // 2MB buffer threshold (under browser ~16MB limit)
     reconnectDelay: 3000,
     reconnectMaxAttempts: 5,
-    pingInterval: 30000,
-    inactivityTimeout: 60000 // 60 seconds of no chunk activity = stalled
+    pingInterval: 30000
 };
 
 // Application state
@@ -38,7 +37,9 @@ const state = {
     pendingFiles: new Map(),
     selectedPeer: null,
     reconnectAttempts: 0,
-    isReconnecting: false,
+    sendWorkers: new Set(),     // peers we are currently sending files to (one file at a time each)
+    currentReceive: new Map(),  // peerId -> transferId that incoming binary chunks belong to
+    peerReconnects: new Map(),  // peerId -> WebRTC reconnect attempts since last success
     localIP: null,
     peerLocality: new Map() // peerId -> 'verified' | 'confirmed' | 'blocked'
 };
@@ -153,7 +154,6 @@ function initializeWebSocket() {
         console.log('WebSocket connected');
         updateConnectionStatus(true);
         state.reconnectAttempts = 0;
-        state.isReconnecting = false;
         startPingInterval();
     };
     
@@ -171,17 +171,18 @@ function initializeWebSocket() {
         state.peers.clear();
         updateDevicesList();
         
-        // Attempt reconnection
-        if (!state.isReconnecting && state.reconnectAttempts < CONFIG.reconnectMaxAttempts) {
-            state.isReconnecting = true;
+        // Attempt reconnection. Each failed attempt closes its socket and lands
+        // here again, so attempts chain until one succeeds or we give up.
+        if (state.reconnectAttempts < CONFIG.reconnectMaxAttempts) {
             state.reconnectAttempts++;
-            
+
             showToast(`Reconnecting... (${state.reconnectAttempts}/${CONFIG.reconnectMaxAttempts})`, 'warning');
-            
+
+            // Back off a little more on every attempt
             setTimeout(() => {
                 initializeWebSocket();
-            }, CONFIG.reconnectDelay);
-        } else if (state.reconnectAttempts >= CONFIG.reconnectMaxAttempts) {
+            }, CONFIG.reconnectDelay * state.reconnectAttempts);
+        } else {
             showToast('Failed to connect to server. Please refresh the page.', 'error');
         }
     };
@@ -402,8 +403,9 @@ async function createConnection(peerId, isInitiator = true) {
         console.log(`Connection state with ${peerId}: ${connection.connectionState}`);
 
         if (connection.connectionState === 'failed' || connection.connectionState === 'disconnected') {
-            handleConnectionFailure(peerId);
+            handleConnectionFailure(peerId, connection);
         } else if (connection.connectionState === 'connected') {
+            state.peerReconnects.delete(peerId);
             showToast(`Connected to ${state.peers.get(peerId)?.name || 'device'}`, 'success');
             // Verify locality of the connection
             verifyLocality(connection, peerId).then(() => onPeerRouteChecked(peerId));
@@ -439,26 +441,32 @@ function setupDataChannel(dataChannel, peerId) {
         console.log(`Data channel opened with ${peerId}`);
         updateDevicesList();
         onPeerRouteChecked(peerId);
-        
-        // Resume any pending transfers
-        const pendingTransfer = state.activeTransfers.get(peerId);
-        if (pendingTransfer && pendingTransfer.status === 'paused') {
-            resumeTransfer(peerId);
-        }
+
+        // Pick up transfers that were cut off by a dropped connection. The
+        // receiver knows how much arrived, so it asks the sender to continue.
+        state.activeTransfers.forEach(transfer => {
+            if (transfer.peerId === peerId && transfer.direction === 'receive' &&
+                transfer.status === 'paused' && transfer.interrupted) {
+                requestResume(transfer);
+            }
+        });
     };
-    
+
     dataChannel.onclose = () => {
         console.log(`Data channel closed with ${peerId}`);
         // A replaced connection's old channel may close after the new one is
         // registered — only forget the channel if it is still the current one.
         if (state.dataChannels.get(peerId) === dataChannel) {
             state.dataChannels.delete(peerId);
+            interruptTransfers(peerId);
         }
         updateDevicesList();
     };
-    
-    dataChannel.onerror = (error) => {
-        console.error(`Data channel error with ${peerId}:`, error);
+
+    dataChannel.onerror = (event) => {
+        // SCTP cause 12 = "User-Initiated Abort": we closed it ourselves
+        if (event.error && event.error.sctpCauseCode === 12) return;
+        console.error(`Data channel error with ${peerId}:`, event);
         showToast(`Connection error with ${state.peers.get(peerId)?.name || 'device'}`, 'error');
     };
     
@@ -722,6 +730,17 @@ async function checkLocalityBeforeTransfer(peerId) {
 }
 
 // File transfer functions
+//
+// Protocol over the data channel (JSON messages + raw binary chunks):
+//   file-start {transferId, name, size, ...}  → binary chunks →  file-end {totalBytes}
+//   transfer-pause / transfer-cancel            either side
+//   transfer-resume {offset}                    receiver → sender: continue from offset
+//   transfer-resume-request                     sender → receiver: please send transfer-resume
+//   file-resume-start {offset}                  sender → receiver: chunks from offset follow
+// Binary chunks carry no header: they belong to the file most recently started
+// (or resumed) by that peer. A sender therefore sends one file at a time, and a
+// receiver drops chunks between asking to resume and file-resume-start (they
+// are leftovers from before the pause and will be sent again).
 async function sendFiles(peerId, files) {
     const dataChannel = state.dataChannels.get(peerId);
 
@@ -747,164 +766,169 @@ async function sendFiles(peerId, files) {
         showToast('Transfer cancelled: route not verified as local', 'warning');
         return;
     }
-    
+
     // Add files to queue
     for (const file of files) {
         const transferId = generateTransferId();
         const transfer = {
             id: transferId,
             file: file,
+            fileName: file.name,
+            fileSize: file.size,
             peerId: peerId,
             direction: 'send',
             progress: 0,
             bytesTransferred: 0,
             status: 'queued',
             startTime: null,
-            chunks: [],
-            currentChunk: 0
+            startBytes: 0
         };
-        
+
         state.transferQueue.push(transfer);
         state.activeTransfers.set(transferId, transfer);
         addTransferToUI(transfer);
     }
-    
+
     // Process queue
     processTransferQueue();
 }
 
-// Process transfer queue
-async function processTransferQueue() {
-    const pendingTransfers = state.transferQueue.filter(t => t.status === 'queued');
-    
-    for (const transfer of pendingTransfers) {
-        if (transfer.direction === 'send') {
+// Start a send worker for every peer that has queued files
+function processTransferQueue() {
+    const peers = new Set(state.transferQueue
+        .filter(t => t.status === 'queued')
+        .map(t => t.peerId));
+    peers.forEach(peerId => runSendWorker(peerId));
+}
+
+// Send a peer's queued files strictly one after another (see protocol above)
+async function runSendWorker(peerId) {
+    if (state.sendWorkers.has(peerId)) return; // the running worker picks new files up
+    state.sendWorkers.add(peerId);
+    try {
+        let transfer;
+        while ((transfer = state.transferQueue.find(t => t.peerId === peerId && t.status === 'queued'))) {
             await startFileSend(transfer);
+            const dc = state.dataChannels.get(peerId);
+            if (!dc || dc.readyState !== 'open') break; // resumes once reconnected
         }
+    } finally {
+        state.sendWorkers.delete(peerId);
     }
 }
 
-// Start sending file
+function removeFromQueue(transfer) {
+    const index = state.transferQueue.indexOf(transfer);
+    if (index > -1) {
+        state.transferQueue.splice(index, 1);
+    }
+}
+
+// A send stopped on an error: if the channel is gone it can be resumed later,
+// otherwise it failed.
+function markSendStopped(transfer, dataChannel) {
+    if (dataChannel.readyState !== 'open') {
+        transfer.status = 'paused';
+        transfer.interrupted = true;
+    } else {
+        transfer.status = 'failed';
+        showToast(`Failed to send ${transfer.fileName}`, 'error');
+    }
+    updateTransferUI(transfer);
+}
+
+// Send one file (or the rest of it, when resuming)
 async function startFileSend(transfer) {
     const dataChannel = state.dataChannels.get(transfer.peerId);
-    
+
     if (!dataChannel || dataChannel.readyState !== 'open') {
         transfer.status = 'paused';
+        transfer.interrupted = true;
         updateTransferUI(transfer);
         return;
     }
-    
+
+    const resuming = transfer.resumeOffset !== undefined;
+    const startOffset = resuming ? transfer.resumeOffset : 0;
+    delete transfer.resumeOffset;
+
     transfer.status = 'sending';
+    transfer.interrupted = false;
+    transfer.bytesTransferred = startOffset;
     transfer.startTime = Date.now();
+    transfer.startBytes = startOffset;
     updateTransferUI(transfer);
-    
+
     // Compute effective chunk size for this connection
     const effectiveChunkSize = getEffectiveChunkSize(transfer.peerId);
     console.log(`Using chunk size ${effectiveChunkSize} for transfer ${transfer.id}`);
 
-    // Send file metadata as JSON (includes chunkSize so receiver knows boundaries)
-    const metadata = {
-        type: 'file-start',
-        transferId: transfer.id,
-        name: transfer.file.name,
-        size: transfer.file.size,
-        mimeType: transfer.file.type,
-        lastModified: transfer.file.lastModified,
-        chunkSize: effectiveChunkSize
-    };
+    try {
+        if (resuming) {
+            await sendWithFlowControl(dataChannel, JSON.stringify({
+                type: 'file-resume-start',
+                transferId: transfer.id,
+                offset: startOffset
+            }));
+        } else {
+            // File metadata as JSON (chunkSize tells the receiver the boundaries)
+            await sendWithFlowControl(dataChannel, JSON.stringify({
+                type: 'file-start',
+                transferId: transfer.id,
+                name: transfer.file.name,
+                size: transfer.file.size,
+                mimeType: transfer.file.type,
+                lastModified: transfer.file.lastModified,
+                chunkSize: effectiveChunkSize
+            }));
+        }
+    } catch (error) {
+        markSendStopped(transfer, dataChannel);
+        return;
+    }
 
-    await sendWithFlowControl(dataChannel, JSON.stringify(metadata));
+    let offset = startOffset;
+    while (offset < transfer.file.size) {
+        // Paused or cancelled by either side — stop after the chunk in flight
+        if (transfer.status !== 'sending') return;
 
-    // Track inactivity for timeout
-    transfer.lastActivity = Date.now();
+        let buffer;
+        try {
+            buffer = await transfer.file.slice(offset, offset + effectiveChunkSize).arrayBuffer();
+            if (transfer.status !== 'sending') return;
+            // Send only binary data (no per-chunk JSON metadata)
+            await sendWithFlowControl(dataChannel, buffer);
+        } catch (error) {
+            console.error('Error sending chunk:', error);
+            markSendStopped(transfer, dataChannel);
+            return;
+        }
 
-    // Wrap the entire send loop in a Promise so processTransferQueue
-    // truly awaits each file before starting the next one
-    await new Promise((resolveTransfer, rejectTransfer) => {
-        const reader = new FileReader();
-        let offset = transfer.bytesTransferred;
+        offset += buffer.byteLength;
+        transfer.bytesTransferred = offset;
+        transfer.progress = (offset / transfer.file.size) * 100;
+        updateTransferUI(transfer);
+    }
 
-        const readNextChunk = async () => {
-            if (offset >= transfer.file.size) {
-                // File transfer complete
-                try {
-                    await sendWithFlowControl(dataChannel, JSON.stringify({
-                        type: 'file-end',
-                        transferId: transfer.id,
-                        totalBytes: offset
-                    }));
-                    transfer.status = 'completed';
-                    updateTransferUI(transfer);
-                    showToast(`Sent ${transfer.file.name}`, 'success');
-                    resolveTransfer();
-                } catch (error) {
-                    transfer.status = 'failed';
-                    updateTransferUI(transfer);
-                    showToast(`Failed to send ${transfer.file.name}`, 'error');
-                    resolveTransfer();
-                }
-                return;
-            }
+    try {
+        await sendWithFlowControl(dataChannel, JSON.stringify({
+            type: 'file-end',
+            transferId: transfer.id,
+            totalBytes: offset
+        }));
+    } catch (error) {
+        markSendStopped(transfer, dataChannel);
+        return;
+    }
 
-            if (transfer.status === 'paused' || transfer.status === 'cancelled') {
-                resolveTransfer();
-                return;
-            }
-
-            // Inactivity timeout check
-            if (Date.now() - transfer.lastActivity > CONFIG.inactivityTimeout) {
-                transfer.status = 'failed';
-                updateTransferUI(transfer);
-                showToast(`Transfer timed out: ${transfer.file.name}`, 'error');
-                resolveTransfer();
-                return;
-            }
-
-            const chunk = transfer.file.slice(offset, offset + effectiveChunkSize);
-            reader.readAsArrayBuffer(chunk);
-        };
-
-        reader.onload = async (event) => {
-            if (dataChannel.readyState !== 'open') {
-                transfer.status = 'paused';
-                updateTransferUI(transfer);
-                resolveTransfer();
-                return;
-            }
-
-            try {
-                // Send only binary data (no per-chunk JSON metadata)
-                await sendWithFlowControl(dataChannel, event.target.result);
-
-                offset += event.target.result.byteLength;
-                transfer.bytesTransferred = offset;
-                transfer.progress = (offset / transfer.file.size) * 100;
-                transfer.lastActivity = Date.now();
-                updateTransferUI(transfer);
-
-                // Continue reading immediately
-                queueMicrotask(readNextChunk);
-            } catch (error) {
-                console.error('Error sending chunk:', error);
-                transfer.status = 'failed';
-                updateTransferUI(transfer);
-                showToast(`Failed to send ${transfer.file.name}`, 'error');
-                resolveTransfer();
-            }
-        };
-
-        reader.onerror = () => {
-            transfer.status = 'failed';
-            updateTransferUI(transfer);
-            showToast(`Failed to send ${transfer.file.name}`, 'error');
-            resolveTransfer();
-        };
-
-        readNextChunk();
-    });
+    transfer.status = 'completed';
+    transfer.progress = 100;
+    updateTransferUI(transfer);
+    showToast(`Sent ${transfer.fileName}`, 'success');
+    // Re-added if the receiver turns out to be missing data and asks to resume
+    removeFromQueue(transfer);
 }
 
-// Send data with flow control to prevent buffer overflow
 // Get effective chunk size for a connection, respecting SCTP maxMessageSize
 function getEffectiveChunkSize(peerId) {
     const connection = state.connections.get(peerId);
@@ -917,6 +941,7 @@ function getEffectiveChunkSize(peerId) {
     return CONFIG.chunkSize; // fallback to default 64KB
 }
 
+// Send data with flow control to prevent buffer overflow
 async function sendWithFlowControl(dataChannel, data) {
     if (dataChannel.readyState !== 'open') {
         throw new Error('DataChannel is not open');
@@ -929,6 +954,8 @@ async function sendWithFlowControl(dataChannel, data) {
             // shared-text send may wait on the same channel at once, and a single
             // handler property would let one overwrite (and stall) the other.
             dataChannel.addEventListener('bufferedamountlow', resolve, { once: true });
+            // ...and don't wait forever if the channel closes meanwhile
+            dataChannel.addEventListener('close', resolve, { once: true });
         });
 
         if (dataChannel.readyState !== 'open') {
@@ -946,7 +973,7 @@ function handleDataChannelMessage(event, peerId) {
         handleBinaryData(event.data, peerId);
         return;
     }
-    
+
     // Handle JSON messages
     try {
         const message = JSON.parse(event.data);
@@ -954,6 +981,10 @@ function handleDataChannelMessage(event, peerId) {
         switch (message.type) {
             case 'file-start':
                 handleFileStart(message, peerId);
+                break;
+
+            case 'file-resume-start':
+                handleFileResumeStart(message, peerId);
                 break;
 
             case 'file-end':
@@ -964,8 +995,16 @@ function handleDataChannelMessage(event, peerId) {
                 handleTransferCancel(message, peerId);
                 break;
 
+            case 'transfer-pause':
+                handleTransferPause(message, peerId);
+                break;
+
             case 'transfer-resume':
                 handleTransferResume(message, peerId);
+                break;
+
+            case 'transfer-resume-request':
+                handleTransferResumeRequest(message, peerId);
                 break;
 
             case 'text-sync':
@@ -977,44 +1016,43 @@ function handleDataChannelMessage(event, peerId) {
     }
 }
 
+// Find a transfer that belongs to this peer (ids come from the other side)
+function getPeerTransfer(transferId, peerId, direction) {
+    const transfer = state.activeTransfers.get(transferId);
+    if (!transfer || transfer.peerId !== peerId || transfer.direction !== direction) return null;
+    return transfer;
+}
+
 // Handle binary data (actual file chunks - no per-chunk metadata needed)
 function handleBinaryData(data, peerId) {
-    // Find the active receiving transfer for this peer
-    for (const [transferId, transfer] of state.activeTransfers) {
-        if (transfer.peerId === peerId &&
-            transfer.direction === 'receive' &&
-            transfer.status === 'receiving') {
+    const transfer = state.activeTransfers.get(state.currentReceive.get(peerId));
 
-            // Store the binary chunk
-            const chunkData = new Uint8Array(data);
-
-            // If streaming to disk, serialize writes via a promise chain
-            if (transfer.writableStream) {
-                const writePromise = (transfer.writeChain || Promise.resolve())
-                    .then(() => transfer.writableStream.write(chunkData))
-                    .then(() => {
-                        transfer.bytesReceived += chunkData.byteLength;
-                        transfer.progress = (transfer.bytesReceived / transfer.fileSize) * 100;
-                        transfer.lastActivity = Date.now();
-                        updateTransferUI(transfer);
-                    })
-                    .catch(err => {
-                        console.error('Error writing to stream:', err);
-                        transfer.status = 'failed';
-                        updateTransferUI(transfer);
-                    });
-                transfer.writeChain = writePromise;
-            } else {
-                // Accumulate in memory (fallback)
-                transfer.chunks.push(chunkData);
-                transfer.bytesReceived += chunkData.byteLength;
-                transfer.progress = (transfer.bytesReceived / transfer.fileSize) * 100;
-                transfer.lastActivity = Date.now();
-                updateTransferUI(transfer);
-            }
-            break;
-        }
+    // Chunks still in flight after a pause are kept ('paused'); after cancel,
+    // failure or a resume request they are dropped.
+    if (!transfer || transfer.awaitingResume ||
+        (transfer.status !== 'receiving' && transfer.status !== 'paused')) {
+        return;
     }
+
+    const chunkData = new Uint8Array(data);
+    transfer.bytesReceived += chunkData.byteLength;
+    transfer.progress = transfer.fileSize ? (transfer.bytesReceived / transfer.fileSize) * 100 : 100;
+
+    if (transfer.writableStream) {
+        // Streaming to disk: serialize writes via a promise chain
+        const stream = transfer.writableStream;
+        transfer.writeChain = (transfer.writeChain || Promise.resolve())
+            .then(() => stream.write(chunkData))
+            .catch(err => {
+                console.error('Error writing to stream:', err);
+                transfer.status = 'failed';
+                updateTransferUI(transfer);
+            });
+    } else {
+        // Accumulate in memory
+        transfer.chunks.push(chunkData);
+    }
+    updateTransferUI(transfer);
 }
 
 // Handle incoming file start
@@ -1027,92 +1065,135 @@ function handleFileStart(message, peerId) {
         return;
     }
 
+    const canSaveToDisk = message.size > 100 * 1024 * 1024 && typeof window.showSaveFilePicker === 'function';
     const transfer = {
         id: message.transferId,
         peerId: peerId,
         direction: 'receive',
         fileName: message.name,
         fileSize: message.size,
-        mimeType: message.mimeType,
+        mimeType: typeof message.mimeType === 'string' ? message.mimeType : '',
         progress: 0,
         bytesReceived: 0,
         status: 'receiving',
         startTime: Date.now(),
-        lastActivity: Date.now(),
+        startBytes: 0,
         chunks: [],
         writableStream: null,
-        writeChain: null
+        writeChain: null,
+        canSaveToDisk: canSaveToDisk,
+        awaitingResume: false
     };
 
     // Register transfer FIRST so incoming binary chunks are not lost
     state.activeTransfers.set(message.transferId, transfer);
+    state.currentReceive.set(peerId, message.transferId);
     addTransferToUI(transfer);
 
     showToast(`Receiving ${message.name} from ${state.peers.get(peerId)?.name || 'device'}`, 'info');
 
-    // For large files, try to set up streaming to disk asynchronously
-    // Chunks will accumulate in transfer.chunks until the stream is ready,
-    // then we flush them and switch to streaming mode
-    if (message.size > 100 * 1024 * 1024 && typeof window.showSaveFilePicker === 'function') {
-        setupStreamingReceive(transfer, message);
+    // Saving straight to disk needs a click (browsers only open the save
+    // dialog on a user gesture), so offer a button; meanwhile chunks collect in memory.
+    if (canSaveToDisk) {
+        showToast(`${message.name} is large — click "Save to disk" in the queue to stream it to a file`, 'info');
     } else if (message.size > 500 * 1024 * 1024) {
         showToast(`Warning: ${message.name} is very large (${formatFileSize(message.size)}). May use significant memory.`, 'warning');
     }
 }
 
-// Set up streaming receive asynchronously (chunks accumulate in memory until ready)
-async function setupStreamingReceive(transfer, message) {
+// "Save to disk" button: switch a running receive to streaming into a file.
+// Chunks received so far are flushed first.
+async function saveTransferToDisk(transferId) {
+    const transfer = state.activeTransfers.get(transferId);
+    if (!transfer || !transfer.canSaveToDisk || transfer.writableStream) return;
+
+    let writable;
     try {
-        const fileHandle = await window.showSaveFilePicker({
-            suggestedName: message.name,
-            types: [{
-                description: 'File',
-                accept: { [message.mimeType || 'application/octet-stream']: [] }
-            }]
-        });
-        const writable = await fileHandle.createWritable();
-
-        // Switch to streaming mode FIRST, so new chunks go through writeChain
-        // instead of appending to transfer.chunks
-        transfer.writableStream = writable;
-
-        // Snapshot the accumulated chunks and clear the array atomically
-        const pendingChunks = transfer.chunks;
-        transfer.chunks = [];
-
-        // Flush pending chunks through the write chain so they serialize
-        // with any new chunks arriving via handleBinaryData
-        let flushChain = Promise.resolve();
-        for (const chunk of pendingChunks) {
-            flushChain = flushChain.then(() => writable.write(chunk));
-        }
-        transfer.writeChain = flushChain;
-
-        console.log(`Streaming large file ${message.name} directly to disk (flushed ${pendingChunks.length} buffered chunks)`);
+        const fileHandle = await window.showSaveFilePicker({ suggestedName: transfer.fileName });
+        writable = await fileHandle.createWritable();
     } catch (err) {
-        // User cancelled or API not supported - stay in memory mode
-        console.log('File System Access API unavailable or cancelled, using in-memory fallback');
-        if (message.size > 500 * 1024 * 1024) {
-            showToast(`Warning: ${message.name} is very large (${formatFileSize(message.size)}). May use significant memory.`, 'warning');
-        }
+        // User cancelled the dialog — stay in memory mode, button stays available
+        console.log('Save dialog cancelled, keeping the file in memory');
+        return;
+    }
+
+    // The transfer may have finished or stopped while the dialog was open
+    if (transfer.status !== 'receiving' && transfer.status !== 'paused') {
+        try { await writable.abort(); } catch (_) { /* nothing to clean up */ }
+        return;
+    }
+
+    // Switch to streaming mode FIRST, so new chunks go through writeChain
+    // instead of appending to transfer.chunks
+    transfer.writableStream = writable;
+    transfer.canSaveToDisk = false;
+
+    // Snapshot the accumulated chunks and clear the array atomically
+    const pendingChunks = transfer.chunks;
+    transfer.chunks = [];
+
+    // Flush pending chunks through the write chain so they serialize
+    // with any new chunks arriving via handleBinaryData
+    let flushChain = transfer.writeChain || Promise.resolve();
+    for (const chunk of pendingChunks) {
+        flushChain = flushChain.then(() => writable.write(chunk));
+    }
+    transfer.writeChain = flushChain.catch(err => {
+        console.error('Error writing to stream:', err);
+        transfer.status = 'failed';
+        updateTransferUI(transfer);
+    });
+
+    updateTransferUI(transfer);
+    console.log(`Streaming ${transfer.fileName} to disk (flushed ${pendingChunks.length} buffered chunks)`);
+}
+
+// Throw away whatever a receive has collected (cancel / failure)
+async function discardReceivedData(transfer) {
+    transfer.chunks = [];
+    if (transfer.writableStream) {
+        const stream = transfer.writableStream;
+        transfer.writableStream = null;
+        try {
+            await (transfer.writeChain || Promise.resolve());
+            await stream.abort(); // removes the partial file
+        } catch (_) { /* already closed */ }
     }
 }
 
 // Handle file end
 async function handleFileEnd(message, peerId) {
-    const transfer = state.activeTransfers.get(message.transferId);
-
+    const transfer = getPeerTransfer(message.transferId, peerId, 'receive');
     if (!transfer) {
         console.error('Transfer not found:', message.transferId);
         return;
     }
+    // End of a stream we already asked to restart — the resumed stream sends its own
+    if (transfer.awaitingResume || (transfer.status !== 'receiving' && transfer.status !== 'paused')) {
+        return;
+    }
+    if (state.currentReceive.get(peerId) === transfer.id) {
+        state.currentReceive.delete(peerId);
+    }
+
+    // Wait for all pending disk writes before checking anything
+    if (transfer.writeChain) {
+        await transfer.writeChain;
+    }
+
+    // Integrity check BEFORE handing the file over
+    const expected = Number.isFinite(message.totalBytes) ? message.totalBytes : transfer.fileSize;
+    if (transfer.status === 'failed' || transfer.bytesReceived !== expected || expected !== transfer.fileSize) {
+        console.error(`Size mismatch: received ${transfer.bytesReceived}, expected ${transfer.fileSize}`);
+        transfer.status = 'failed';
+        await discardReceivedData(transfer);
+        updateTransferUI(transfer);
+        showToast(`Transfer corrupted: ${transfer.fileName} (incomplete)`, 'error');
+        return;
+    }
 
     if (transfer.writableStream) {
-        // Wait for all pending writes to finish before closing
         try {
-            if (transfer.writeChain) {
-                await transfer.writeChain;
-            }
             await transfer.writableStream.close();
         } catch (err) {
             console.error('Error closing writable stream:', err);
@@ -1138,71 +1219,143 @@ async function handleFileEnd(message, peerId) {
         transfer.chunks = []; // Free memory
     }
 
-    // Integrity check: verify total bytes if sender included it
-    if (message.totalBytes && transfer.bytesReceived !== message.totalBytes) {
-        console.error(`Size mismatch: received ${transfer.bytesReceived}, expected ${message.totalBytes}`);
-        transfer.status = 'failed';
-        updateTransferUI(transfer);
-        showToast(`Transfer corrupted: ${transfer.fileName} (size mismatch)`, 'error');
-        return;
-    }
-
     transfer.status = 'completed';
+    transfer.progress = 100;
+    transfer.canSaveToDisk = false;
     updateTransferUI(transfer);
 
     showToast(`Received ${transfer.fileName}`, 'success');
 }
 
-// Resume transfer
+// Receiver side: ask the sender to continue from what actually arrived
+function requestResume(transfer) {
+    const dataChannel = state.dataChannels.get(transfer.peerId);
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+        showToast('Device is not connected — reconnect it to resume', 'warning');
+        return;
+    }
+    // Until the sender's file-resume-start arrives, leftover chunks are dropped
+    transfer.awaitingResume = true;
+    transfer.interrupted = false;
+    dataChannel.send(JSON.stringify({
+        type: 'transfer-resume',
+        transferId: transfer.id,
+        offset: transfer.bytesReceived
+    }));
+    updateTransferUI(transfer);
+}
+
+// Receiver: the sender restarts the stream at `offset`
+function handleFileResumeStart(message, peerId) {
+    const transfer = getPeerTransfer(message.transferId, peerId, 'receive');
+    if (!transfer || !transfer.awaitingResume) return;
+
+    if (message.offset !== transfer.bytesReceived) {
+        // Should not happen — the offset is ours. Don't risk a corrupt file.
+        transfer.status = 'failed';
+        discardReceivedData(transfer);
+        updateTransferUI(transfer);
+        notifyPeer(transfer, 'transfer-cancel');
+        showToast(`Could not resume ${transfer.fileName}`, 'error');
+        return;
+    }
+
+    transfer.awaitingResume = false;
+    transfer.status = 'receiving';
+    transfer.startTime = Date.now();
+    transfer.startBytes = transfer.bytesReceived;
+    state.currentReceive.set(peerId, transfer.id);
+    updateTransferUI(transfer);
+}
+
+// Sender: the receiver wants the rest of the file from `offset`
+function handleTransferResume(message, peerId) {
+    const transfer = getPeerTransfer(message.transferId, peerId, 'send');
+    if (!transfer || transfer.status === 'cancelled') return;
+
+    const offset = message.offset;
+    if (!Number.isInteger(offset) || offset < 0 || offset > transfer.file.size) return;
+
+    transfer.resumeOffset = offset;
+    transfer.status = 'queued';
+    if (!state.transferQueue.includes(transfer)) {
+        state.transferQueue.push(transfer);
+    }
+    updateTransferUI(transfer);
+    processTransferQueue();
+}
+
+// Receiver: the sender pressed Resume
+function handleTransferResumeRequest(message, peerId) {
+    const transfer = getPeerTransfer(message.transferId, peerId, 'receive');
+    if (transfer && transfer.status === 'paused' && !transfer.awaitingResume) {
+        requestResume(transfer);
+    }
+}
+
+function notifyPeer(transfer, type) {
+    const dataChannel = state.dataChannels.get(transfer.peerId);
+    if (dataChannel && dataChannel.readyState === 'open') {
+        dataChannel.send(JSON.stringify({ type, transferId: transfer.id }));
+    }
+}
+
+// Pause (button) — both sides stop; Resume continues where it left off
+function pauseTransfer(transferId) {
+    const transfer = state.activeTransfers.get(transferId);
+    if (!transfer || (transfer.status !== 'sending' && transfer.status !== 'receiving')) return;
+
+    transfer.status = 'paused';
+    transfer.interrupted = false;
+    updateTransferUI(transfer);
+    notifyPeer(transfer, 'transfer-pause');
+}
+
+function handleTransferPause(message, peerId) {
+    const transfer = state.activeTransfers.get(message.transferId);
+    if (!transfer || transfer.peerId !== peerId) return;
+    if (transfer.status === 'sending' || transfer.status === 'receiving') {
+        transfer.status = 'paused';
+        transfer.interrupted = false;
+        updateTransferUI(transfer);
+        showToast(`Transfer paused by ${state.peers.get(peerId)?.name || 'device'}`, 'info');
+    }
+}
+
+// Resume (button)
 function resumeTransfer(transferId) {
     const transfer = state.activeTransfers.get(transferId);
-    
+
     if (!transfer || transfer.status !== 'paused') {
         return;
     }
-    
-    if (transfer.direction === 'send') {
-        transfer.status = 'queued';
-        processTransferQueue();
+
+    if (transfer.direction === 'receive') {
+        if (!transfer.awaitingResume) requestResume(transfer);
     } else {
-        // Send resume request
+        // The receiver decides the offset, so ask it to request the resume
         const dataChannel = state.dataChannels.get(transfer.peerId);
-        if (dataChannel && dataChannel.readyState === 'open') {
-            dataChannel.send(JSON.stringify({
-                type: 'transfer-resume',
-                transferId: transfer.id,
-                offset: transfer.bytesReceived
-            }));
+        if (!dataChannel || dataChannel.readyState !== 'open') {
+            showToast('Device is not connected — reconnect it to resume', 'warning');
+            return;
         }
+        notifyPeer(transfer, 'transfer-resume-request');
     }
 }
 
 // Cancel transfer
 function cancelTransfer(transferId) {
     const transfer = state.activeTransfers.get(transferId);
-    
+
     if (!transfer) {
         return;
     }
-    
+
     transfer.status = 'cancelled';
     updateTransferUI(transfer);
-    
-    // Notify peer
-    const dataChannel = state.dataChannels.get(transfer.peerId);
-    if (dataChannel && dataChannel.readyState === 'open') {
-        dataChannel.send(JSON.stringify({
-            type: 'transfer-cancel',
-            transferId: transfer.id
-        }));
-    }
-    
-    // Remove from queue
-    const index = state.transferQueue.indexOf(transfer);
-    if (index > -1) {
-        state.transferQueue.splice(index, 1);
-    }
-    
+    notifyPeer(transfer, 'transfer-cancel');
+    stopTransferLocally(transfer);
+
     // Remove from UI after delay
     setTimeout(() => {
         removeTransferFromUI(transfer.id);
@@ -1210,32 +1363,49 @@ function cancelTransfer(transferId) {
     }, 3000);
 }
 
+// Free what a stopped transfer holds
+function stopTransferLocally(transfer) {
+    removeFromQueue(transfer);
+    if (transfer.direction === 'receive') {
+        discardReceivedData(transfer);
+        if (state.currentReceive.get(transfer.peerId) === transfer.id) {
+            state.currentReceive.delete(transfer.peerId);
+        }
+    }
+}
+
 // Handle transfer cancel from peer
 function handleTransferCancel(message, peerId) {
     const transfer = state.activeTransfers.get(message.transferId);
-    
-    if (transfer) {
+
+    if (transfer && transfer.peerId === peerId &&
+        transfer.status !== 'completed' && transfer.status !== 'cancelled') {
         transfer.status = 'cancelled';
+        stopTransferLocally(transfer);
         updateTransferUI(transfer);
         showToast(`Transfer cancelled by ${state.peers.get(peerId)?.name || 'device'}`, 'warning');
     }
 }
 
-// Handle transfer resume from peer
-function handleTransferResume(message, peerId) {
-    const transfer = state.activeTransfers.get(message.transferId);
-    
-    if (transfer && transfer.direction === 'send') {
-        transfer.bytesTransferred = message.offset;
-        transfer.status = 'queued';
-        processTransferQueue();
-    }
+// Mark running transfers with a peer as interrupted (connection dropped);
+// they resume automatically when a new data channel opens.
+function interruptTransfers(peerId) {
+    state.activeTransfers.forEach(transfer => {
+        if (transfer.peerId === peerId && (transfer.status === 'sending' || transfer.status === 'receiving')) {
+            transfer.status = 'paused';
+            transfer.interrupted = true;
+            updateTransferUI(transfer);
+        }
+    });
 }
 
 // Handle peer disconnect
 function handlePeerDisconnect(peerId) {
+    const peerName = state.peers.get(peerId)?.name || 'Device';
+
     state.peers.delete(peerId);
     state.peerLocality.delete(peerId);
+    state.peerReconnects.delete(peerId);
     state.sharedText.p2pIncoming.delete(peerId);
 
     // Close connection
@@ -1247,37 +1417,54 @@ function handlePeerDisconnect(peerId) {
 
     // Remove data channel
     state.dataChannels.delete(peerId);
-    
-    // Pause active transfers
+
+    // The peer's session is gone for good (a returning device gets a new id),
+    // so its unfinished transfers can't be resumed
     state.activeTransfers.forEach(transfer => {
-        if (transfer.peerId === peerId && (transfer.status === 'sending' || transfer.status === 'receiving')) {
-            transfer.status = 'paused';
+        if (transfer.peerId === peerId &&
+            !['completed', 'cancelled', 'failed'].includes(transfer.status)) {
+            transfer.status = 'failed';
+            stopTransferLocally(transfer);
             updateTransferUI(transfer);
         }
     });
-    
+
     updateDevicesList();
-    showToast(`${state.peers.get(peerId)?.name || 'Device'} disconnected`, 'info');
+    showToast(`${peerName} disconnected`, 'info');
 }
 
-// Handle connection failure
-function handleConnectionFailure(peerId) {
-    console.log(`Connection failed with ${peerId}, attempting reconnection...`);
-    
-    // Pause active transfers
-    state.activeTransfers.forEach(transfer => {
-        if (transfer.peerId === peerId && (transfer.status === 'sending' || transfer.status === 'receiving')) {
-            transfer.status = 'paused';
-            updateTransferUI(transfer);
-        }
-    });
-    
-    // Attempt reconnection
+// Handle a WebRTC connection that went 'disconnected' or 'failed'
+function handleConnectionFailure(peerId, connection) {
+    // 'disconnected' often recovers by itself (e.g. a Wi-Fi blip) — give it time
+    const grace = connection.connectionState === 'disconnected' ? 5000 : 0;
+
     setTimeout(() => {
-        if (state.peers.has(peerId)) {
-            connectToPeer(peerId);
+        if (state.connections.get(peerId) !== connection) return; // already replaced
+        if (connection.connectionState === 'connected') return;  // recovered
+
+        console.log(`Connection with ${peerId} lost, reconnecting...`);
+        connection.close();
+        state.connections.delete(peerId);
+        state.dataChannels.delete(peerId);
+        interruptTransfers(peerId);
+        updateDevicesList();
+
+        const attempts = (state.peerReconnects.get(peerId) || 0) + 1;
+        if (!state.peers.has(peerId)) return;
+        if (attempts > 3) {
+            showToast(`Lost connection to ${state.peers.get(peerId)?.name || 'device'}. Click it to reconnect.`, 'error');
+            state.peerReconnects.delete(peerId);
+            return;
         }
-    }, CONFIG.reconnectDelay);
+        state.peerReconnects.set(peerId, attempts);
+
+        // Attempt reconnection (unless the other side already did)
+        setTimeout(() => {
+            if (state.peers.has(peerId) && !state.connections.has(peerId)) {
+                connectToPeer(peerId);
+            }
+        }, CONFIG.reconnectDelay);
+    }, grace);
 }
 
 // UI Functions
@@ -1365,23 +1552,29 @@ function openFilePicker(peerId) {
     dropTargetName.textContent = peer?.name || 'device';
     
     // Clear preview area
-    document.getElementById('previewArea').innerHTML = '';
+    clearPreviews();
     document.getElementById('sendFilesBtn').style.display = 'none';
-    
+
     dropZone.classList.remove('hidden');
+}
+
+// Image previews hold object URLs — release them along with the previews
+const previewUrls = [];
+
+function clearPreviews() {
+    previewUrls.splice(0).forEach(url => URL.revokeObjectURL(url));
+    document.getElementById('previewArea').innerHTML = '';
 }
 
 // Handle file selection
 function handleFileSelection(files, peerId) {
-    console.log(files)
     if (files.length === 0) return;
-    
-    const peer = state.peers.get(peerId);
+
     const previewArea = document.getElementById('previewArea');
     const sendFilesBtn = document.getElementById('sendFilesBtn');
-    
+
     // Clear previous previews
-    previewArea.innerHTML = '';
+    clearPreviews();
     
     // Create previews
     Array.from(files).forEach(file => {
@@ -1391,6 +1584,7 @@ function handleFileSelection(files, peerId) {
         if (file.type.startsWith('image/')) {
             const img = document.createElement('img');
             img.src = URL.createObjectURL(file);
+            previewUrls.push(img.src);
             preview.appendChild(img);
         } else {
             const icon = document.createElement('div');
@@ -1463,17 +1657,11 @@ function addTransferToUI(transfer) {
             <div class="progress-fill" style="width: ${transfer.progress}%"></div>
         </div>
         <div class="progress-text" id="progress-${transfer.id}">0% • 0 B / ${formatFileSize(fileSize)}</div>
-        <div class="transfer-actions">
-            ${transfer.status === 'paused' ? 
-                `<button onclick="resumeTransfer('${transfer.id}')">Resume</button>` : ''}
-            ${transfer.status === 'sending' || transfer.status === 'receiving' ? 
-                `<button onclick="pauseTransfer('${transfer.id}')">Pause</button>` : ''}
-            ${transfer.status !== 'completed' && transfer.status !== 'cancelled' ? 
-                `<button onclick="cancelTransfer('${transfer.id}')">Cancel</button>` : ''}
-        </div>
+        <div class="transfer-actions"></div>
     `;
-    
+
     transferQueue.appendChild(transferItem);
+    updateTransferUI(transfer);
 }
 
 function updateTransferUI(transfer) {
@@ -1489,39 +1677,51 @@ function updateTransferUI(transfer) {
     const speedElement = document.getElementById(`speed-${transfer.id}`);
     const actionsDiv = transferItem.querySelector('.transfer-actions');
     
+    const statusLabel = transfer.awaitingResume ? 'resuming'
+        : (transfer.status === 'paused' && transfer.interrupted) ? 'interrupted'
+        : transfer.status;
     statusElement.className = `transfer-status ${transfer.status}`;
-    statusElement.textContent = transfer.status;
+    statusElement.textContent = statusLabel;
     progressFill.style.width = `${transfer.progress}%`;
-    
+
     // Update progress text
     const transferred = transfer.bytesTransferred || transfer.bytesReceived || 0;
     const total = transfer.file?.size || transfer.fileSize || 0;
     progressText.textContent = `${Math.round(transfer.progress)}% • ${formatFileSize(transferred)} / ${formatFileSize(total)}`;
-    
-    // Calculate and show speed
+
+    // Calculate and show speed (since the transfer last started or resumed)
     if (transfer.startTime && (transfer.status === 'sending' || transfer.status === 'receiving')) {
         const elapsed = (Date.now() - transfer.startTime) / 1000; // seconds
-        const speed = transferred / elapsed; // bytes per second
+        const speed = (transferred - (transfer.startBytes || 0)) / elapsed; // bytes per second
         const remaining = (total - transferred) / speed; // seconds
-        
+
         speedElement.textContent = `${formatFileSize(speed)}/s • ${formatTime(remaining)} remaining`;
     } else {
         speedElement.textContent = '';
     }
-    
+
     // Update actions
     let actionsHTML = '';
-    if (transfer.status === 'paused') {
-        actionsHTML = `<button onclick="resumeTransfer('${transfer.id}')">Resume</button>`;
+    if (transfer.canSaveToDisk && !transfer.writableStream &&
+        (transfer.status === 'receiving' || transfer.status === 'paused')) {
+        actionsHTML += `<button onclick="saveTransferToDisk('${transfer.id}')">Save to disk</button>`;
+    }
+    if (transfer.status === 'paused' && !transfer.awaitingResume) {
+        actionsHTML += `<button onclick="resumeTransfer('${transfer.id}')">Resume</button>`;
     } else if (transfer.status === 'sending' || transfer.status === 'receiving') {
-        actionsHTML = `<button onclick="pauseTransfer('${transfer.id}')">Pause</button>`;
+        actionsHTML += `<button onclick="pauseTransfer('${transfer.id}')">Pause</button>`;
     }
-    
+
     if (transfer.status !== 'completed' && transfer.status !== 'cancelled') {
-        actionsHTML += `<button onclick="cancelTransfer('${transfer.id}')">Cancel</button>`;
+        actionsHTML += `<button onclick="cancelTransfer('${transfer.id}')">${transfer.status === 'failed' ? 'Dismiss' : 'Cancel'}</button>`;
     }
-    
-    actionsDiv.innerHTML = actionsHTML;
+
+    // Only touch the buttons when they change — this runs for every chunk, and
+    // re-creating a button under the cursor would swallow the click
+    if (actionsDiv.dataset.html !== actionsHTML) {
+        actionsDiv.dataset.html = actionsHTML;
+        actionsDiv.innerHTML = actionsHTML;
+    }
 }
 
 // Format time in seconds to readable format
@@ -1578,10 +1778,7 @@ function setupDragAndDrop() {
     const selectFilesBtn = document.getElementById('selectFilesBtn');
     const cancelDropBtn = document.getElementById('cancelDropBtn');
     const fileInput = document.getElementById('fileInput');
-    
-    let draggedFiles = [];
-    let targetPeerId = null;
-    
+
     // File input change handler
     fileInput.addEventListener('change', (e) => {
         const files = e.target.files;
@@ -1655,9 +1852,7 @@ function setupDragAndDrop() {
         }
         
         state.selectedPeer = peerId;
-        targetPeerId = peerId;
-        draggedFiles = files;
-        
+
         // Show drop zone with preview
         openFilePicker(peerId);
         handleFileSelection(files, peerId);
@@ -1694,10 +1889,6 @@ function setupDragAndDrop() {
         const peerId = state.selectedPeer;
         const files = state.pendingFiles.get(peerId);
 
-        console.log(peerId)
-        console.log(files)
-        console.log(state.pendingFiles)
-
         if (files && files.length > 0 && peerId) {
             await sendFiles(peerId, files);
             hideDropZone();
@@ -1711,11 +1902,10 @@ function setupDragAndDrop() {
     
     function hideDropZone() {
         dropZone.classList.add('hidden');
-        previewArea.innerHTML = '';
-        draggedFiles = [];
-        targetPeerId = null;
+        clearPreviews();
         state.selectedPeer = null;
-        // state.pendingFiles.clear();
+        // Queued transfers keep their own File references
+        state.pendingFiles.clear();
     }
 }
 
@@ -2464,10 +2654,5 @@ async function loadVersionInfo() {
 // Make functions globally accessible for inline onclick handlers
 window.resumeTransfer = resumeTransfer;
 window.cancelTransfer = cancelTransfer;
-window.pauseTransfer = (transferId) => {
-    const transfer = state.activeTransfers.get(transferId);
-    if (transfer) {
-        transfer.status = 'paused';
-        updateTransferUI(transfer);
-    }
-};
+window.pauseTransfer = pauseTransfer;
+window.saveTransferToDisk = saveTransferToDisk;
