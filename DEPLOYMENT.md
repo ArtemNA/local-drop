@@ -149,6 +149,9 @@ When users open this link, they automatically join room ABC123
 | `TRUSTED_PROXY_HOPS` | Number | Reverse proxies in front of the app, used to read the client IP from `X-Forwarded-For` (default: 1) |
 | `MAINTENANCE_MODE` | true/false | Show the maintenance page to all visitors |
 | `CLIENT_IDLE_TIMEOUT_MS` | Number | Drop clients that sent nothing for this long, e.g. pages frozen by the browser (default: 150000) |
+| `BACKSEAT_TTL_SEC` | Number | Lifetime of a Backseat short code (`/api/backseat`) in seconds (default: 300) |
+| `BACKSEAT_MAX_ENTRIES` | Number | Max Backseat codes held at once; above it POST answers 503 (default: 10000) |
+| `BACKSEAT_POST_PER_MIN` / `BACKSEAT_GET_PER_MIN` | Number | Per-IP rate limits for creating / reading codes (default: 20 / 60) |
 
 ## Recommended Platforms
 

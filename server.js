@@ -6,6 +6,7 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const os = require('os');
 const crypto = require('crypto');
+const { createBackseatRouter } = require('./backseat');
 
 const app = express();
 const server = http.createServer(app);
@@ -32,6 +33,10 @@ app.use((req, res, next) => {
 
 // Serve static files (relative to this file, so the working directory doesn't matter)
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Backseat short codes. Mounted before the global JSON parser so its own 4KB
+// body limit applies instead of the default 100KB.
+app.use('/api/backseat', createBackseatRouter({ getClientIp }));
 
 app.use(express.json());
 
