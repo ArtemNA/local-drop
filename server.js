@@ -852,7 +852,7 @@ function broadcastToRoom(roomCode, senderId, message) {
 }
 
 const SERVER_START_TIME = new Date().toISOString();
-const APP_VERSION = '2.5.2';
+const APP_VERSION = '2.6.0';
 
 // API endpoint to get server info
 app.get('/api/info', (req, res) => {
